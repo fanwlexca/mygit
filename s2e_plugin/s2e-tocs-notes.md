@@ -1,6 +1,6 @@
 # User Interface
 
-![Fig7](../pictures/fig7.png?raw=true)  
+![Fig7](./pictures/fig7.png?raw=true)  
 
 1. Path Selection  
 	Data-based selection:  
@@ -49,7 +49,7 @@
 
 # Developer Interface
 
-![Table II](../pictures/tableII.png?raw=true)   
+![Table II](./pictures/tableII.png?raw=true)   
 
 Execution Path Abstraction:each path<->a distinct ExecutionState object instance  
 
