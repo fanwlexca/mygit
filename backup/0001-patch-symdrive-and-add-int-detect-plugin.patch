@@ -1,0 +1,4760 @@
+From c7d9f3b6db18538684a18548785d137eb58176ec Mon Sep 17 00:00:00 2001
+From: Wenliang Fan <fanwlexca@gmail.com>
+Date: Fri, 17 Jan 2014 15:42:19 +0800
+Subject: [PATCH] patch symdrive and add int detect plugin
+
+---
+ Makefile                                           |   4 +-
+ guest/include/s2e.h                                | 456 +++++++++++++++++---
+ klee/include/klee/Executor.h                       |   4 +-
+ klee/lib/Core/AddressSpace.cpp                     |  36 ++
+ klee/lib/Core/AddressSpace.h                       |   3 +
+ klee/runtime/POSIX/testing-dir/a                   |   1 -
+ klee/runtime/POSIX/testing-dir/b                   |   1 -
+ qemu/Makefile.target                               |   4 +
+ qemu/audio/sdlaudio.c                              |   4 +-
+ qemu/configure                                     |   2 +-
+ qemu/exec.c                                        |  33 ++
+ qemu/hw/fakepci.c                                  |  86 +++-
+ qemu/hw/fakepci.h                                  |   4 +
+ qemu/hw/pci.c                                      |  18 +
+ qemu/llvm-lib.h                                    |  11 +-
+ qemu/qemu-options.hx                               |   9 +
+ qemu/s2e/MMUFunctionHandlers.cpp                   |  85 +++-
+ qemu/s2e/Plugins/BaseInstructions.cpp              | 195 ++++++++-
+ qemu/s2e/Plugins/BaseInstructions.h                |   5 +
+ qemu/s2e/Plugins/CorePlugin.cpp                    | 117 ++++++
+ qemu/s2e/Plugins/CorePlugin.h                      |  29 ++
+ .../Plugins/ExecutionTracers/ExecutionTracer.cpp   |   4 +-
+ qemu/s2e/Plugins/ExecutionTracers/TraceEntries.h   |  71 ++++
+ qemu/s2e/Plugins/ModuleDescriptor.h                |   2 +
+ qemu/s2e/Plugins/RawMonitor.cpp                    |   9 +
+ qemu/s2e/Plugins/RawMonitor.h                      |   2 +
+ qemu/s2e/Plugins/SymbolicHardware.cpp              | 297 +++++++++++--
+ qemu/s2e/Plugins/SymbolicHardware.h                |  15 +-
+ qemu/s2e/S2E.cpp                                   |   4 +-
+ qemu/s2e/S2E.h                                     |   1 +
+ qemu/s2e/S2EExecutionState.cpp                     |   2 +
+ qemu/s2e/S2EExecutor.cpp                           | 156 ++++---
+ qemu/s2e/S2EExecutor.h                             |  29 +-
+ qemu/s2e/s2e_qemu.h                                |  13 +-
+ qemu/softmmu_defs.h                                |   3 +-
+ qemu/softmmu_header.h                              |   6 +-
+ qemu/softmmu_template.h                            | 423 +++++++++++--------
+ qemu/target-i386/op_helper.c                       | 203 +++++----
+ qemu/tcg/tcg-llvm.cpp                              |   6 +-
+ qemu/ui/sdl.c                                      |   4 +-
+ qemu/ui/sdl_zoom.h                                 |   2 +-
+ qemu/vl.c                                          |   9 +
+ stp/include/stp/c_interface.h                      | 463 ++++++++++++++++++++-
+ 43 files changed, 2400 insertions(+), 431 deletions(-)
+ delete mode 120000 klee/runtime/POSIX/testing-dir/a
+ delete mode 120000 klee/runtime/POSIX/testing-dir/b
+ mode change 120000 => 100644 stp/include/stp/c_interface.h
+
+diff --git a/Makefile b/Makefile
+index cf354b9..ecd611f 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,3 +1,5 @@
++# MJR search for "mjr" to find changes
++
+ S2ESRC:=$(CURDIR)/../s2e
+ S2EBUILD:=$(CURDIR)
+ 
+@@ -12,7 +14,7 @@ else ifeq ($(OS),Linux)
+ JOBS := $(shell grep -c ^processor /proc/cpuinfo)
+ endif
+ 
+-all: all-release
++all: all-release all-debug # MJR do both simultaneously
+ 
+ all-release: stamps/qemu-make-release stamps/tools-make-release
+ 
+diff --git a/guest/include/s2e.h b/guest/include/s2e.h
+index 0d37449..5fb6a8e 100644
+--- a/guest/include/s2e.h
++++ b/guest/include/s2e.h
+@@ -34,21 +34,29 @@
+  *
+  */
+ 
+-#include <stdio.h>
+-#include <string.h>
+-#include <inttypes.h>
++#ifndef S2E_MAIN_HEADER_H // MJR
++#define S2E_MAIN_HEADER_H // MJR
++
++//#include <stdio.h> // MJR
++//#include <string.h> // MJR
++//#include <inttypes.h> // MJR
++
++// MJR:
++#define ALWAYS_INLINE static __attribute__((always_inline)) inline
++// #define ALWAYS_INLINE __attribute__((always_inline))
++// #define ALWAYS_INLINE inline
+ 
+ /** Forces the read of every byte of the specified string.
+   * This makes sure the memory pages occupied by the string are paged in
+   * before passing them to S2E, which can't page in memory by itself. */
+-static inline void __s2e_touch_string(volatile const char *string)
++ALWAYS_INLINE void __s2e_touch_string(volatile const char *string)
+ {
+     while(*string) {
+         ++string;
+     }
+ }
+ 
+-static inline void __s2e_touch_buffer(volatile void *buffer, unsigned size)
++ALWAYS_INLINE void __s2e_touch_buffer(volatile void *buffer, unsigned size)
+ {
+     unsigned i;
+     volatile char *b = (volatile char *)buffer;
+@@ -58,7 +66,7 @@ static inline void __s2e_touch_buffer(volatile void *buffer, unsigned size)
+ }
+ 
+ /** Get S2E version or 0 when running without S2E. */
+-static inline int s2e_version()
++ALWAYS_INLINE int s2e_version(void) // MJR
+ {
+     int version;
+     __asm__ __volatile__(
+@@ -71,7 +79,7 @@ static inline int s2e_version()
+ }
+ 
+ /** Print message to the S2E log. */
+-static inline void s2e_message(const char* message)
++ALWAYS_INLINE void s2e_message(const char* message)
+ {
+     __s2e_touch_string(message);
+     __asm__ __volatile__(
+@@ -83,7 +91,7 @@ static inline void s2e_message(const char* message)
+ }
+ 
+ /** Print warning to the S2E log and S2E stdout. */
+-static inline void s2e_warning(const char* message)
++ALWAYS_INLINE void s2e_warning(const char* message)
+ {
+     __s2e_touch_string(message);
+     __asm__ __volatile__(
+@@ -95,7 +103,7 @@ static inline void s2e_warning(const char* message)
+ }
+ 
+ /** Print symbolic expression to the S2E log. */
+-static inline void s2e_print_expression(const char* name, int expression)
++ALWAYS_INLINE void s2e_print_expression(const char* name, int expression)
+ {
+     __s2e_touch_string(name);
+     __asm__ __volatile__(
+@@ -107,7 +115,7 @@ static inline void s2e_print_expression(const char* name, int expression)
+ }
+ 
+ /** Enable forking on symbolic conditions. */
+-static inline void s2e_enable_forking(void)
++ALWAYS_INLINE void s2e_enable_forking(void)
+ {
+     __asm__ __volatile__(
+         ".byte 0x0f, 0x3f\n"
+@@ -117,7 +125,7 @@ static inline void s2e_enable_forking(void)
+ }
+ 
+ /** Disable forking on symbolic conditions. */
+-static inline void s2e_disable_forking(void)
++ALWAYS_INLINE void s2e_disable_forking(void)
+ {
+     __asm__ __volatile__(
+         ".byte 0x0f, 0x3f\n"
+@@ -137,7 +145,7 @@ static inline void s2e_yield(void)
+ }
+ 
+ /** Get the current execution path/state id. */
+-static inline unsigned s2e_get_path_id(void)
++ALWAYS_INLINE unsigned s2e_get_path_id(void)
+ {
+     unsigned id;
+     __asm__ __volatile__(
+@@ -150,7 +158,7 @@ static inline unsigned s2e_get_path_id(void)
+ }
+ 
+ /** Fill buffer with unconstrained symbolic values. */
+-static inline void s2e_make_symbolic(void* buf, int size, const char* name)
++ALWAYS_INLINE void s2e_make_symbolic(void* buf, int size, const char* name)
+ {
+     __s2e_touch_string(name);
+     __s2e_touch_buffer(buf, size);
+@@ -165,8 +173,315 @@ static inline void s2e_make_symbolic(void* buf, int size, const char* name)
+     );
+ }
+ 
++////////////////// MJR -------------------------------------------->
++// MJR 23 in all.
++
++/** Fill buffer with unconstrained symbolic values. */
++/** Equivalent to I/O memory:  writes are discarded */
++/* MJR added this, requires SymbolicHardware */
++ALWAYS_INLINE void s2e_make_dma_symbolic(void* buf, int size, const char* name)
++{
++    __asm__ __volatile__(
++        ".byte 0x0f, 0x3f\n"
++        ".byte 0x00, 0xB1, 0x00, 0x00\n"
++        ".byte 0x00, 0x00, 0x00, 0x00\n"
++        : : "a" (buf), "b" (size), "c" (name) : "memory"
++                         );
++}
++
++/** Remove symbolic mapping. */
++/* Does not leave memory as symbolic afterward. Reads revert to underlying concrete value */
++/* MJR added this, requires SymbolicHardware */
++ALWAYS_INLINE void s2e_free_dma_symbolic(void* buf, int size, const char* name)
++{
++    __asm__ __volatile__(
++        ".byte 0x0f, 0x3f\n"
++        ".byte 0x00, 0xB2, 0x00, 0x00\n"
++        ".byte 0x00, 0x00, 0x00, 0x00\n"
++        : : "a" (buf), "b" (size), "c" (name) : "memory"
++                         );
++}
++
++// MJR added this, requires SymDriveSearcher...
++ALWAYS_INLINE void s2e_prioritize(int line)
++{
++    __asm__ __volatile__(
++        ".byte 0x0f, 0x3f\n"
++        ".byte 0x00, 0xB3, 0x00, 0x00\n"
++        ".byte 0x00, 0x00, 0x00, 0x00\n"
++        : : "a" (line)
++                         );
++}
++
++// MJR added this, requires SymDriveSearcher...
++ALWAYS_INLINE void s2e_deprioritize(int line)
++{
++    __asm__ __volatile__(
++        ".byte 0x0f, 0x3f\n"
++        ".byte 0x00, 0xB4, 0x00, 0x00\n"
++        ".byte 0x00, 0x00, 0x00, 0x00\n"
++        : : "a" (line)
++                         );
++}
++
++// MJR added this, requires SymDriveSearcher...
++ALWAYS_INLINE void s2e_loop_before(int line, int call_id)
++{
++    __asm__ __volatile__(
++        ".byte 0x0f, 0x3f\n"
++        ".byte 0x00, 0xB5, 0x00, 0x00\n"
++        ".byte 0x00, 0x00, 0x00, 0x00\n"
++        : : "a" (line), "b" (call_id)
++                         );
++}
++
++// MJR added this, requires SymDriveSearcher...
++ALWAYS_INLINE void s2e_loop_body(int line, int call_id)
++{
++    __asm__ __volatile__(
++        ".byte 0x0f, 0x3f\n"
++        ".byte 0x00, 0xB6, 0x00, 0x00\n"
++        ".byte 0x00, 0x00, 0x00, 0x00\n"
++        : : "a" (line), "b" (call_id)
++                         );
++}
++
++// MJR added this, requires SymDriveSearcher...
++ALWAYS_INLINE void s2e_loop_after(int line, int call_id)
++{
++    __asm__ __volatile__(
++        ".byte 0x0f, 0x3f\n"
++        ".byte 0x00, 0xB7, 0x00, 0x00\n"
++        ".byte 0x00, 0x00, 0x00, 0x00\n"
++        : : "a" (line), "b" (call_id)
++                         );
++}
++
++// MJR Added this, requires SymDriveSearcher
++ALWAYS_INLINE void s2e_concretize_kill(int line)
++{
++    __asm__ __volatile__(
++        ".byte 0x0f, 0x3f\n"
++        ".byte 0x00, 0xB8, 0x00, 0x00\n"
++        ".byte 0x00, 0x00, 0x00, 0x00\n"
++        : : "a" (line)
++                         );
++}
++
++ALWAYS_INLINE void s2e_concretize_all(int line) {
++    __asm__ __volatile__(
++        ".byte 0x0f, 0x3f\n"
++        ".byte 0x00, 0xB9, 0x00, 0x00\n"
++        ".byte 0x00, 0x00, 0x00, 0x00\n"
++        : : "a" (line)
++                         );
++}
++
++ALWAYS_INLINE void s2e_kill_all_others(int line) {
++    __asm__ __volatile__(
++        ".byte 0x0f, 0x3f\n"
++        ".byte 0x00, 0xBA, 0x00, 0x00\n"
++        ".byte 0x00, 0x00, 0x00, 0x00\n"
++        : : "a" (line)
++                         );
++}
++
++// MJR Added this, requires SymDriveSearcher
++ALWAYS_INLINE void s2e_driver_call_stack(int line, int depth)
++{
++    __asm__ __volatile__(
++        ".byte 0x0f, 0x3f\n"
++        ".byte 0x00, 0xBB, 0x00, 0x00\n"
++        ".byte 0x00, 0x00, 0x00, 0x00\n"
++        : : "a" (line), "b" (depth)
++                         );
++}
++
++// MJR added this, requires SymDriveSearcher...
++ALWAYS_INLINE void s2e_favor_successful(int line, int successful)
++{
++    __asm__ __volatile__(
++        ".byte 0x0f, 0x3f\n"
++        ".byte 0x00, 0xBC, 0x00, 0x00\n"
++        ".byte 0x00, 0x00, 0x00, 0x00\n"
++        : : "a" (line), "b" (successful)
++                         );
++}
++
++// MJR opcode hole
++
++// MJR added this, requires SymDriveSearcher...
++ALWAYS_INLINE void s2e_reset_priorities(int line)
++{
++    __asm__ __volatile__(
++        ".byte 0x0f, 0x3f\n"
++        ".byte 0x00, 0xBE, 0x00, 0x00\n"
++        ".byte 0x00, 0x00, 0x00, 0x00\n"
++        : : "a" (line)
++                         );
++}
++
++// MJR opcode hole
++
++// MJR added this, requires SymDriveSearcher...
++ALWAYS_INLINE void s2e_enable_tracing(int line)
++{
++    __asm__ __volatile__(
++        ".byte 0x0f, 0x3f\n"
++        ".byte 0x00, 0xC0, 0x00, 0x00\n"
++        ".byte 0x00, 0x00, 0x00, 0x00\n"
++        : : "a" (line)
++    );
++}
++
++// MJR added this, requires SymDriveSearcher...
++ALWAYS_INLINE void s2e_disable_tracing(int line)
++{
++    __asm__ __volatile__(
++        ".byte 0x0f, 0x3f\n"
++        ".byte 0x00, 0xC1, 0x00, 0x00\n"
++        ".byte 0x00, 0x00, 0x00, 0x00\n"
++        : : "a" (line)
++    );
++}
++
++// MJR added this, requires SymDriveSearcher...
++/** Notify S2E that we've entered a driver function. */
++ALWAYS_INLINE void s2e_enter_function(int line, const char* message, int wrapper_type)
++{
++    __asm__ __volatile__(
++        ".byte 0x0f, 0x3f\n"
++        ".byte 0x00, 0xC2, 0x00, 0x00\n"
++        ".byte 0x00, 0x00, 0x00, 0x00\n"
++        : : "a" (line), "b" (message), "c" (wrapper_type)
++    );
++}
++
++// MJR added this, requires SymDriveSearcher...
++/** Notify S2E that we've exited a driver function. */
++ALWAYS_INLINE void s2e_exit_function(int line, const char* message, int wrapper_type)
++{
++    __asm__ __volatile__(
++        ".byte 0x0f, 0x3f\n"
++        ".byte 0x00, 0xC3, 0x00, 0x00\n"
++        ".byte 0x00, 0x00, 0x00, 0x00\n"
++        : : "a" (line), "b" (message), "c" (wrapper_type)
++    );
++}
++
++// MJR added this, requires SymDriveSearcher...
++ALWAYS_INLINE int s2e_is_symbolic_symdrive(int line, int expr)
++{
++    int retval;
++    __asm__ __volatile__(
++        ".byte 0x0f, 0x3f\n"
++        ".byte 0x00, 0xC4, 0x00, 0x00\n"
++        ".byte 0x00, 0x00, 0x00, 0x00\n"
++        : "=a" (retval)  : "a" (line), "b" (expr)
++    );
++    return retval;
++}
++
++// MJR added this, requires SymDriveSearcher...
++ALWAYS_INLINE void s2e_success_path(int line, int success)
++{
++    __asm__ __volatile__(
++        ".byte 0x0f, 0x3f\n"
++        ".byte 0x00, 0xC5, 0x00, 0x00\n"
++        ".byte 0x00, 0x00, 0x00, 0x00\n"
++        : : "a" (line), "b" (success)
++    );
++}
++
++// MJR added this, requires SymDriveSearcher...
++ALWAYS_INLINE void s2e_enter_block(int line, const char *fn, int total_blocks, int cur_block)
++{
++    __asm__ __volatile__(
++        ".byte 0x0f, 0x3f\n"
++        ".byte 0x00, 0xC6, 0x00, 0x00\n"
++        ".byte 0x00, 0x00, 0x00, 0x00\n"
++        : : "a" (line), "b" (fn), "c" (total_blocks), "d" (cur_block)
++    );
++}
++
++// MJR added this, requires SymDriveSearcher...
++ALWAYS_INLINE void s2e_primary_fn(int line, const char *fn)
++{
++    __asm__ __volatile__(
++        ".byte 0x0f, 0x3f\n"
++        ".byte 0x00, 0xC7, 0x00, 0x00\n"
++        ".byte 0x00, 0x00, 0x00, 0x00\n"
++        : : "a" (line), "b" (fn)
++                         );
++}
++
++// If changing this:
++// Update SymDriveSearcher.h
++// Update MJR_dump_trackperf function
++// Update MTbTrace
++#define SYMDRIVE_PAUSE_PP 11
++#define SYMDRIVE_CONTINUE_PP 12
++
++#define SYMDRIVE_PAUSE_STUB 21
++#define SYMDRIVE_CONTINUE_STUB 22
++
++#define SYMDRIVE_PAUSE_IRQ 31
++#define SYMDRIVE_CONTINUE_IRQ 32
++
++#define SYMDRIVE_START_AUTO 40
++#define SYMDRIVE_PAUSE_AUTO 41
++#define SYMDRIVE_CONTINUE_AUTO 42
++#define SYMDRIVE_STOP_AUTO 43
++#define SYMDRIVE_DISCARD_AUTO 44
++
++#define SYMDRIVE_START_MANUAL 50
++#define SYMDRIVE_PAUSE_MANUAL 51
++#define SYMDRIVE_CONTINUE_MANUAL 52
++#define SYMDRIVE_STOP_MANUAL 53
++#define SYMDRIVE_DISCARD_MANUAL 54
++
++#define SYMDRIVE_START_FN 60
++#define SYMDRIVE_STOP_FN 61
++
++// MJR added this, requires SymDriveSearcher...
++ALWAYS_INLINE void s2e_enable_trackperf(int line, int flags)
++{
++    __asm__ __volatile__(
++        ".byte 0x0f, 0x3f\n"
++        ".byte 0x00, 0xC8, 0x00, 0x00\n"
++        ".byte 0x00, 0x00, 0x00, 0x00\n"
++        : : "a" (line), "b" (flags)
++                         );
++}
++
++// MJR added this, requires SymDriveSearcher...
++ALWAYS_INLINE void s2e_disable_trackperf(int line, int flags)
++{
++    __asm__ __volatile__(
++        ".byte 0x0f, 0x3f\n"
++        ".byte 0x00, 0xC9, 0x00, 0x00\n"
++        ".byte 0x00, 0x00, 0x00, 0x00\n"
++        : : "a" (line), "b" (flags)
++                         );
++}
++
++// MJR added this, requires SymDriveSearcher...
++#define TRACKPERF_NONTRANSITIVE 0
++#define TRACKPERF_TRANSITIVE 1
++ALWAYS_INLINE void s2e_trackperf_fn(int line, const char *fn, int flags)
++{
++    __asm__ __volatile__(
++        ".byte 0x0f, 0x3f\n"
++        ".byte 0x00, 0xCA, 0x00, 0x00\n"
++        ".byte 0x00, 0x00, 0x00, 0x00\n"
++        : : "a" (line), "b" (fn), "c" (flags)
++                         );
++}
++
++/////////////////////////////////////// <-------------- MJR
++
+ /** Fill buffer with unconstrained symbolic values without discarding concrete data. */
+-static inline void s2e_make_concolic(void* buf, int size, const char* name)
++ALWAYS_INLINE void s2e_make_concolic(void* buf, int size, const char* name)
+ {
+     __s2e_touch_string(name);
+     __s2e_touch_buffer(buf, size);
+@@ -182,7 +497,7 @@ static inline void s2e_make_concolic(void* buf, int size, const char* name)
+ }
+ 
+ /** Returns true if ptr points to symbolic memory */
+-static inline int s2e_is_symbolic(void* ptr, size_t size)
++ALWAYS_INLINE inline int s2e_is_symbolic(void* ptr, size_t size)
+ {
+     int result;
+     __s2e_touch_buffer(ptr, 1);
+@@ -196,7 +511,7 @@ static inline int s2e_is_symbolic(void* ptr, size_t size)
+ }
+ 
+ /** Concretize the expression. */
+-static inline void s2e_concretize(void* buf, int size)
++ALWAYS_INLINE void s2e_concretize(void* buf, int size)
+ {
+     __s2e_touch_buffer(buf, size);
+     __asm__ __volatile__(
+@@ -211,7 +526,7 @@ static inline void s2e_concretize(void* buf, int size)
+ }
+ 
+ /** Get example value for expression (without adding state constraints). */
+-static inline void s2e_get_example(void* buf, int size)
++ALWAYS_INLINE void s2e_get_example(void* buf, int size)
+ {
+     __s2e_touch_buffer(buf, size);
+     __asm__ __volatile__(
+@@ -225,9 +540,28 @@ static inline void s2e_get_example(void* buf, int size)
+     );
+ }
+ 
++//fwl new opcode
++ALWAYS_INLINE void s2e_detect_int(void* buf1, void* buf2, int size, int flag)
++{
++	//__s2e_touch_string(flag);
++    __s2e_touch_buffer(buf1, size);
++    __s2e_touch_buffer(buf2, size);
++    __asm__ __volatile__(
++        //"pushl %%ebx\n"
++        //"movl %%edx, %%ebx\n"
++        ".byte 0x0f, 0x3f\n"
++        ".byte 0x00, 0x80, 0x00, 0x00\n"
++        ".byte 0x00, 0x00, 0x00, 0x00\n"
++        //"popl %%ebx\n"
++        : : "a" (buf1), "b" (buf2),  "d" (size), "c" (flag) : "memory"
++    );
++}
++
++
++
+ /** Get example value for expression (without adding state constraints). */
+ /** Convenience function to be used in printfs */
+-static inline unsigned s2e_get_example_uint(unsigned val)
++ALWAYS_INLINE unsigned s2e_get_example_uint(unsigned val)
+ {
+     unsigned buf = val;
+     __asm__ __volatile__(
+@@ -243,8 +577,17 @@ static inline unsigned s2e_get_example_uint(unsigned val)
+ }
+ 
+ /** Terminate current state. */
+-static inline void s2e_kill_state(int status, const char* message)
++// MJR changed implementation:
++// ALWAYS_INLINE void s2e_kill_state(int status, const char* message)
++ALWAYS_INLINE void s2e_kill_state(int kill_all, int status, const char* message)
+ {
++    __asm__ __volatile__(
++        ".byte 0x0f, 0x3f\n"
++        ".byte 0x00, 0x06, 0x00, 0x00\n"
++        ".byte 0x00, 0x00, 0x00, 0x00\n"
++        : : "a" (kill_all), "d" (status), "c" (message)
++    );
++/*
+     __s2e_touch_string(message);
+     __asm__ __volatile__(
+         "pushl %%ebx\n"
+@@ -255,10 +598,11 @@ static inline void s2e_kill_state(int status, const char* message)
+         "popl %%ebx\n"
+         : : "a" (status), "d" (message)
+     );
++*/
+ }
+ 
+ /** Disable timer interrupt in the guest. */
+-static inline void s2e_disable_timer_interrupt()
++ALWAYS_INLINE void s2e_disable_timer_interrupt(void) // MJR
+ {
+     __asm__ __volatile__(
+         ".byte 0x0f, 0x3f\n"
+@@ -268,7 +612,7 @@ static inline void s2e_disable_timer_interrupt()
+ }
+ 
+ /** Enable timer interrupt in the guest. */
+-static inline void s2e_enable_timer_interrupt()
++ALWAYS_INLINE void s2e_enable_timer_interrupt(void) // MJR
+ {
+     __asm__ __volatile__(
+         ".byte 0x0f, 0x3f\n"
+@@ -278,7 +622,7 @@ static inline void s2e_enable_timer_interrupt()
+ }
+ 
+ /** Disable all APIC interrupts in the guest. */
+-static inline void s2e_disable_all_apic_interrupts()
++ALWAYS_INLINE void s2e_disable_all_apic_interrupts(void) // MJR
+ {
+     __asm__ __volatile__(
+         ".byte 0x0f, 0x3f\n"
+@@ -288,7 +632,7 @@ static inline void s2e_disable_all_apic_interrupts()
+ }
+ 
+ /** Enable all APIC interrupts in the guest. */
+-static inline void s2e_enable_all_apic_interrupts()
++ALWAYS_INLINE void s2e_enable_all_apic_interrupts(void) // MJR
+ {
+     __asm__ __volatile__(
+         ".byte 0x0f, 0x3f\n"
+@@ -298,7 +642,7 @@ static inline void s2e_enable_all_apic_interrupts()
+ }
+ 
+ /** Get the current S2E_RAM_OBJECT_BITS configuration macro */
+-static inline int s2e_get_ram_object_bits()
++ALWAYS_INLINE int s2e_get_ram_object_bits(void) // MJR
+ {
+     int bits;
+     __asm__ __volatile__(
+@@ -314,7 +658,7 @@ static inline int s2e_get_ram_object_bits()
+  *  all states when they reach this point.
+  *
+  * NOTE: This requires merge searcher to be enabled. */
+-static inline void s2e_merge_point()
++ALWAYS_INLINE void s2e_merge_point(void) // MJR
+ {
+     __asm__ __volatile__(
+         ".byte 0x0f, 0x3f\n"
+@@ -326,7 +670,7 @@ static inline void s2e_merge_point()
+ /** Open file from the guest.
+  *
+  * NOTE: This require HostFiles plugin. */
+-static inline int s2e_open(const char* fname)
++ALWAYS_INLINE int s2e_open(const char* fname)
+ {
+     int fd;
+     __s2e_touch_string(fname);
+@@ -342,7 +686,7 @@ static inline int s2e_open(const char* fname)
+ /** Close file from the guest.
+  *
+  * NOTE: This require HostFiles plugin. */
+-static inline int s2e_close(int fd)
++ALWAYS_INLINE int s2e_close(int fd)
+ {
+     int res;
+     __asm__ __volatile__(
+@@ -357,7 +701,7 @@ static inline int s2e_close(int fd)
+ /** Read file content from the guest.
+  *
+  * NOTE: This require HostFiles plugin. */
+-static inline int s2e_read(int fd, char* buf, int count)
++ALWAYS_INLINE int s2e_read(int fd, char* buf, int count)
+ {
+     int res;
+     __s2e_touch_buffer(buf, count);
+@@ -396,7 +740,7 @@ static inline void s2e_memtracer_disable()
+ /** Raw monitor plugin */
+ /** Communicates to S2E the coordinates of loaded modules. Useful when there is
+     no plugin to automatically parse OS data structures */
+-static inline void s2e_rawmon_loadmodule(const char *name, unsigned loadbase, unsigned size)
++ALWAYS_INLINE void s2e_rawmon_loadmodule(const char *name, unsigned loadbase, unsigned size)
+ {
+     __s2e_touch_string(name);
+     __asm__ __volatile__(
+@@ -410,6 +754,8 @@ static inline void s2e_rawmon_loadmodule(const char *name, unsigned loadbase, un
+     );
+ }
+ 
++#if 0
++//  MJR commented out
+ typedef struct _s2e_opcode_module_config_t {
+     uint32_t name;
+     uint64_t nativeBase;
+@@ -422,7 +768,7 @@ typedef struct _s2e_opcode_module_config_t {
+ /** Raw monitor plugin */
+ /** Communicates to S2E the coordinates of loaded modules. Useful when there is
+     no plugin to automatically parse OS data structures */
+-static inline void s2e_rawmon_loadmodule2(const char *name,
++ALWAYS_INLINE void s2e_rawmon_loadmodule2(const char *name,
+                                          uint64_t nativebase,
+                                          uint64_t loadbase,
+                                          uint64_t entrypoint,
+@@ -445,10 +791,13 @@ static inline void s2e_rawmon_loadmodule2(const char *name,
+         : : "c" (&cfg)
+     );
+ }
++#endif
+ 
++#if 0
++// MJR commented out
+ /** CodeSelector plugin */
+ /** Enable forking in the current process (entire address space or user mode only) */
+-static inline void s2e_codeselector_enable_address_space(unsigned user_mode_only)
++ALWAYS_INLINE void s2e_codeselector_enable_address_space(unsigned user_mode_only)
+ {
+     __asm__ __volatile__(
+         ".byte 0x0f, 0x3f\n"
+@@ -460,7 +809,7 @@ static inline void s2e_codeselector_enable_address_space(unsigned user_mode_only
+ 
+ /** Disable forking in the specified process (represented by its page directory).
+     If pagedir is 0, disable forking in the current process. */
+-static inline void s2e_codeselector_disable_address_space(uint64_t pagedir)
++ALWAYS_INLINE void s2e_codeselector_disable_address_space(uint64_t pagedir)
+ {
+     __asm__ __volatile__(
+         ".byte 0x0f, 0x3f\n"
+@@ -469,8 +818,9 @@ static inline void s2e_codeselector_disable_address_space(uint64_t pagedir)
+         : : "c" (pagedir)
+     );
+ }
++#endif
+ 
+-static inline void s2e_codeselector_select_module(const char *moduleId)
++ALWAYS_INLINE void s2e_codeselector_select_module(const char *moduleId)
+ {
+     __s2e_touch_string(moduleId);
+     __asm__ __volatile__(
+@@ -482,7 +832,8 @@ static inline void s2e_codeselector_select_module(const char *moduleId)
+ }
+ 
+ /** Programmatically add a new configuration entry to the ModuleExecutionDetector plugin */
+-static inline void s2e_moduleexec_add_module(const char *moduleId, const char *moduleName, int kernelMode)
++ALWAYS_INLINE void s2e_moduleexec_add_module(const char *moduleId, const char *moduleName, int kernelMode)
++   
+ {
+     __s2e_touch_string(moduleId);
+     __s2e_touch_string(moduleName);
+@@ -506,7 +857,9 @@ static inline void s2e_moduleexec_add_module(const char *moduleId, const char *m
+  *
+  * The returned name is an absolute path to the program file.
+  */
+-static inline int s2e_get_module_info(const char *moduleToRetrieve,
++#if 0
++//  MJR Commented out
++ALWAYS_INLINE int s2e_get_module_info(const char *moduleToRetrieve,
+                                 char *name, size_t maxNameLength,
+                                 uint64_t *loadBase, uint64_t *size)
+ {
+@@ -559,23 +912,25 @@ static inline int s2e_get_module_info(const char *moduleToRetrieve,
+     fclose(maps);
+     return result;
+ }
++#endif
+ 
+ /* Kills the current state if b is zero */
+-static inline void _s2e_assert(int b, const char *expression )
++ALWAYS_INLINE void _s2e_assert(int b, const char *expression )
+ {
+    if (!b) {
+-      s2e_kill_state(0, expression);
++       s2e_kill_state(1, 0, expression); // MJR added 1
+    }
+ }
+ 
+ #define s2e_assert(expression) _s2e_assert(expression, "Assertion failed: "  #expression)
+ 
+ /** Returns a symbolic value in [start, end) */
+-static inline int s2e_range(int start, int end, const char* name) {
++ALWAYS_INLINE int s2e_range(int start, int end, const char* name)
++{
+   int x = -1;
+ 
+   if (start >= end) {
+-    s2e_kill_state(1, "s2e_range: invalid range");
++      s2e_kill_state(1, 1, "s2e_range: invalid range"); // MJR added 1
+   }
+ 
+   if (start+1==end) {
+@@ -586,11 +941,11 @@ static inline int s2e_range(int start, int end, const char* name) {
+     /* Make nicer constraint when simple... */
+     if (start==0) {
+       if ((unsigned) x >= (unsigned) end) {
+-        s2e_kill_state(0, "s2e_range creating a constraint...");
++          s2e_kill_state(1, 0, "s2e_range creating a constraint..."); // MJR added 1
+       }
+     } else {
+       if (x < start || x >= end) {
+-        s2e_kill_state(0, "s2e_range creating a constraint...");
++          s2e_kill_state(1, 0, "s2e_range creating a constraint..."); // MJR added 1
+       }
+     }
+ 
+@@ -598,21 +953,4 @@ static inline int s2e_range(int start, int end, const char* name) {
+   }
+ }
+ 
+-/**
+- *  Transmits a buffer of dataSize length to the plugin named in pluginName.
+- *  eax contains the failure code upon return, 0 for success.
+- */
+-static inline int s2e_invoke_plugin(const char *pluginName, void *data, uint32_t dataSize)
+-{
+-    int result;
+-    __s2e_touch_string(pluginName);
+-    __s2e_touch_buffer(data, dataSize);
+-    __asm__ __volatile__(
+-        ".byte 0x0f, 0x3f\n"
+-        ".byte 0x00, 0x0b, 0x00, 0x00\n"
+-        ".byte 0x00, 0x00, 0x00, 0x00\n"
+-        : "=a" (result) : "a" (pluginName), "c" (data), "d" (dataSize) : "memory"
+-    );
+-
+-    return result;
+-}
++#endif
+diff --git a/klee/include/klee/Executor.h b/klee/include/klee/Executor.h
+index 170c5ad..ce0469e 100644
+--- a/klee/include/klee/Executor.h
++++ b/klee/include/klee/Executor.h
+@@ -292,7 +292,7 @@ protected:
+   /// function is a wrapper around the state's addConstraint function
+   /// which also manages manages propogation of implied values,
+   /// validity checks, and seed patching.
+-  void addConstraint(ExecutionState &state, ref<Expr> condition);
++  //void addConstraint(ExecutionState &state, ref<Expr> condition);
+ 
+   // Called on [for now] concrete reads, replaces constant with a symbolic
+   // Used for testing.
+@@ -386,6 +386,8 @@ public:
+     return *interpreterHandler;
+   }
+ 
++  void addConstraint(ExecutionState &state, ref<Expr> condition); //fwl modified
++
+   // Fork current and return states in which condition holds / does
+   // not hold, respectively. One of the states is necessarily the
+   // current state, and one of the states may be null.
+diff --git a/klee/lib/Core/AddressSpace.cpp b/klee/lib/Core/AddressSpace.cpp
+index 3b7b805..ea6527c 100644
+--- a/klee/lib/Core/AddressSpace.cpp
++++ b/klee/lib/Core/AddressSpace.cpp
+@@ -15,6 +15,7 @@
+ #include "klee/Expr.h"
+ #include "klee/TimerStatIncrementer.h"
+ #include "klee/ExecutionState.h"
++#include "klee/Executor.h"
+ 
+ using namespace klee;
+ 
+@@ -351,6 +352,41 @@ bool AddressSpace::copyInConcretes() {
+   return true;
+ }
+ 
++//
++// The purpose of this function is to concretize all symbolic
++// data in the current "address space."  The idea is to collapse all
++// the constraints, and just give us concrete data.  Ideally we'd not
++// need this but sometimes constraints get out of hand.
++//
++void AddressSpace::concretizeAll(Executor *e) {
++    unsigned int object_offset;
++    int i, j;
++    i = 0;
++    j = 0;
++    for (MemoryMap::iterator it = objects.begin(),
++             ie = objects.end(); it != ie; ++it) {
++        ObjectState *os = it->second;
++        for (object_offset = 0; object_offset < os->size; object_offset++) {
++            ref<klee::Expr> oldexpr;
++            if (os->knownSymbolics != NULL) {
++                oldexpr = os->knownSymbolics[object_offset];
++            } else {
++                continue;
++            }
++
++            if (oldexpr.get() == NULL) {
++                continue;
++            }
++
++            ref<klee::ConstantExpr> expr = e->toConstantSilent(*state, oldexpr);
++            os->setKnownSymbolic (object_offset, expr.get());
++            j++;
++        }
++        i++;
++    }
++    // std::cerr << "AddressSpace: " << i << ", " << j << std::endl;
++}
++
+ /***/
+ 
+ bool MemoryObjectLT::operator()(const MemoryObject *a, const MemoryObject *b) const {
+diff --git a/klee/lib/Core/AddressSpace.h b/klee/lib/Core/AddressSpace.h
+index 276a865..d9440df 100644
+--- a/klee/lib/Core/AddressSpace.h
++++ b/klee/lib/Core/AddressSpace.h
+@@ -16,6 +16,7 @@
+ #include "klee/Internal/ADT/ImmutableMap.h"
+ 
+ namespace klee {
++  class Executor;
+   class ExecutionState;
+   class MemoryObject;
+   class ObjectState;
+@@ -134,6 +135,8 @@ namespace klee {
+     /// \retval true The copy succeeded. 
+     /// \retval false The copy failed because a read-only object was modified.
+     bool copyInConcretes();
++
++    void concretizeAll(Executor *e); // MJR
+   };
+ } // End klee namespace
+ 
+diff --git a/klee/runtime/POSIX/testing-dir/a b/klee/runtime/POSIX/testing-dir/a
+deleted file mode 120000
+index dc1dc0c..0000000
+--- a/klee/runtime/POSIX/testing-dir/a
++++ /dev/null
+@@ -1 +0,0 @@
+-/dev/null
+\ No newline at end of file
+diff --git a/klee/runtime/POSIX/testing-dir/b b/klee/runtime/POSIX/testing-dir/b
+deleted file mode 120000
+index b9251ec..0000000
+--- a/klee/runtime/POSIX/testing-dir/b
++++ /dev/null
+@@ -1 +0,0 @@
+-/dev/random
+\ No newline at end of file
+diff --git a/qemu/Makefile.target b/qemu/Makefile.target
+index 1e6960a..28d8664 100644
+--- a/qemu/Makefile.target
++++ b/qemu/Makefile.target
+@@ -496,6 +496,8 @@ s2eobj-y += s2e/Plugins/Annotation.o
+ s2eobj-y += s2e/Plugins/Searchers/MaxTbSearcher.o
+ s2eobj-y += s2e/Plugins/Searchers/CooperativeSearcher.o
+ s2eobj-y += s2e/Plugins/Searchers/ConcolicDFSSearcher.o
++s2eobj-y += s2e/Plugins/SymDrive/SymDriveTranslationBlockTracer.o
++s2eobj-y += s2e/Plugins/SymDrive/SymDriveSearcher.o
+ s2eobj-y += s2e/Plugins/HostFiles.o
+ 
+ s2eobj-y += s2e/Plugins/MemoryChecker.o
+@@ -540,6 +542,8 @@ s2e/Plugins/ExecutionTracers/InstructionCounter.o: QEMU_CXXFLAGS+=-fno-inline
+ s2e/Plugins/ExecutionTracers/TranslationBlockTracer.o: QEMU_CXXFLAGS+=-fno-inline
+ s2e/Plugins/Searchers/MaxTbSearcher.o: QEMU_CXXFLAGS+=-fno-inline
+ s2e/Plugins/Searchers/CooperativeSearcher.o: QEMU_CXXFLAGS+=-fno-inline
++s2e/Plugins/SymDrive/SymDriveTranslationBlockTracer.o: QEMU_CXXFLAGS+=-fno-inline
++s2e/Plugins/SymDrive/SymDriveSearcher.o: QEMU_CXXFLAGS+=-fno-inline
+ s2e/Plugins/WindowsApi/NdisHandlers.o: QEMU_CXXFLAGS+=-fno-inline
+ s2e/Plugins/WindowsApi/NdisProtocolHandlers.o: QEMU_CXXFLAGS+=-fno-inline
+ s2e/Plugins/WindowsApi/NtoskrnlHandlers.o: QEMU_CXXFLAGS+=-fno-inline
+diff --git a/qemu/audio/sdlaudio.c b/qemu/audio/sdlaudio.c
+index d24daa5..7c28b23 100644
+--- a/qemu/audio/sdlaudio.c
++++ b/qemu/audio/sdlaudio.c
+@@ -21,8 +21,8 @@
+  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+  * THE SOFTWARE.
+  */
+-#include <SDL.h>
+-#include <SDL_thread.h>
++#include <SDL/SDL.h>
++#include <SDL/SDL_thread.h>
+ #include "qemu-common.h"
+ #include "audio.h"
+ 
+diff --git a/qemu/configure b/qemu/configure
+index 848949c..3ab5d7d 100755
+--- a/qemu/configure
++++ b/qemu/configure
+@@ -3831,7 +3831,7 @@ symlink $source_path/Makefile.target $target_dir/Makefile
+ if test "$target_s2e" = "yes"; then
+   S2E_DIRS="s2e s2e/Interceptor s2e/Plugins s2e/Plugins/WindowsInterceptor s2e/Configuration s2e/Signals"
+   S2E_DIRS="$S2E_DIRS s2e/Plugins/DataSelectors s2e/Plugins/ExecutionTracers"
+-  S2E_DIRS="$S2E_DIRS s2e/Plugins/WindowsApi s2e/Plugins/Searchers"
++  S2E_DIRS="$S2E_DIRS s2e/Plugins/WindowsApi s2e/Plugins/Searchers s2e/Plugins/SymDrive"
+   for dir in $S2E_DIRS ; do
+     mkdir -p $target_dir/$dir
+   done
+diff --git a/qemu/exec.c b/qemu/exec.c
+index 847d89f..9c6cdbb 100644
+--- a/qemu/exec.c
++++ b/qemu/exec.c
+@@ -4879,6 +4879,39 @@ tb_page_addr_t get_page_addr_code(CPUArchState *env1, target_ulong addr)
+     return qemu_ram_addr_from_host_nofail(p);
+ }
+ 
++#ifdef CONFIG_S2E
++uint64_t symbhw_read(void *opaque, target_phys_addr_t addr, unsigned size);
++void symbhw_write(void *opaque, target_phys_addr_t addr, uint64_t data, unsigned size);
++
++int s2e_issymfunc(struct MemoryRegion *mr, target_ulong addr)
++{
++    subpage_t *mmio;
++    unsigned int idx;
++    MemoryRegionSection *section;
++    void *fr, *fw;
++
++    fr = mr->ops->read;
++    fw = mr->ops->write;
++
++    if (fr == subpage_read &&
++        fw == subpage_write) {
++        int result;
++        mmio = (subpage_t *) mr->opaque;
++        idx = SUBPAGE_IDX(addr);
++        section = &phys_sections[mmio->sub_section[idx]];
++
++        result =
++            (section->mr->ops->read == symbhw_read) &&
++            (section->mr->ops->write == symbhw_write);
++        return result;
++    } else if (fr == symbhw_read &&
++               fw == symbhw_write) {
++        return 1;
++    }
++    return 0;
++}
++#endif
++
+ /*
+  * A helper function for the _utterly broken_ virtio device model to find out if
+  * it's running on a big endian machine. Don't do this at home kids!
+diff --git a/qemu/hw/fakepci.c b/qemu/hw/fakepci.c
+index 0c5f954..a078529 100644
+--- a/qemu/hw/fakepci.c
++++ b/qemu/hw/fakepci.c
+@@ -44,6 +44,10 @@
+ #include "qemu-common.h"
+ #include "hw/hw.h"
+ #include "hw/pci.h"
++
++#include "hw/msi.h" // MSI support
++#include "hw/pcie.h" // PCI-E support
++
+ #include "fakepci.h"
+ 
+ 
+@@ -76,7 +80,7 @@ typedef struct _PCIFakeState {
+     PCIDevice dev;
+     fake_pci_t fake_pci;
+     MemoryRegion io[PCI_NUM_REGIONS];
+-}PCIFakeState;
++} PCIFakeState;
+ 
+ static int pci_fake_init(PCIDevice *pci_dev)
+ {
+@@ -88,13 +92,48 @@ static int pci_fake_init(PCIDevice *pci_dev)
+ 
+     pci_conf = d->dev.config;
+     pci_conf[PCI_HEADER_TYPE] = PCI_HEADER_TYPE_NORMAL; // header_type
+-    pci_conf[0x3d] = 1; // interrupt pin 0
++    pci_conf[PCI_INTERRUPT_PIN] = 1; // interrupt pin 0
+ 
+     char *name_io = malloc(strlen(d->fake_pci.name) + 20);
+     char *name_mmio = malloc(strlen(d->fake_pci.name) + 20);
+     sprintf(name_io, "%s-io", d->fake_pci.name);
+     sprintf(name_mmio, "%s-mmio", d->fake_pci.name);
+ 
++    if (d->fake_pci.cap_pm > 0) {
++        // Force PCI power management to ON
++        int r = pci_add_capability(pci_dev, PCI_CAP_ID_PM, 0, PCI_PM_SIZEOF);
++        assert (r >= 0 && "Why isn't power management working?");
++    }
++
++    if (d->fake_pci.cap_msi > 0) {
++        // The 0 = find a valid PCI capability offset.
++        // 0x50 seems to work FWIW
++        // The first 64 bytes of PCI config space are
++        // standardized, so 0x50 = the first byte after that.
++        // If we add more capabilities this number might need
++        // to be changed.
++        // false = msi64bit (4th param)
++        // false = msi_per_vector_mask (5th param)
++        msi_init(pci_dev, 0, d->fake_pci.cap_msi, false, false);
++    } else {
++        assert (d->fake_pci.cap_msi == 0 && "?? MSI should be >= 0");
++    }
++
++    if (d->fake_pci.cap_pcie > 0) {
++        int r = pcie_cap_init(pci_dev, 0, PCI_EXP_TYPE_ENDPOINT, 0);
++        assert (r >= 0 && "Why isn't PCI-E working?");
++    }
++
++    if (d->fake_pci.cap_pm > 0) {
++        assert (pci_find_capability(pci_dev, PCI_CAP_ID_PM) != 0 && "cap PM bug.");
++    }
++    if (d->fake_pci.cap_msi > 0) {
++        assert (pci_find_capability(pci_dev, PCI_CAP_ID_MSI) != 0 && "cap MSI bug.");
++    }
++    if (d->fake_pci.cap_pcie > 0) {
++        assert (pci_find_capability(pci_dev, PCI_CAP_ID_EXP) != 0 && "cap PCI-E bug.");
++    }
++
+     for(i=0; i<d->fake_pci.num_resources; ++i) {
+         int type = d->fake_pci.resources[i].type;
+         int size = d->fake_pci.resources[i].size;
+@@ -102,7 +141,7 @@ static int pci_fake_init(PCIDevice *pci_dev)
+ 
+         if (type == PCI_BASE_ADDRESS_SPACE_IO) {
+             name = name_io;
+-        } else if (type == PCI_BASE_ADDRESS_SPACE_MEMORY) {
++        } else /* if (type == PCI_BASE_ADDRESS_SPACE_MEMORY) MJR */ {
+             name = name_mmio;
+         }
+ 
+@@ -124,11 +163,22 @@ static int pci_fake_uninit(PCIDevice *dev)
+         memory_region_destroy(&d->io[i]);
+     }
+ 
++    // PM support requires no special shutdown
++
++    // MSI support
++    if (d->fake_pci.cap_msi > 0) {
++        msi_uninit(dev);
++    }
++
++    // PCI-E support
++    if (d->fake_pci.cap_pcie > 0) {
++        pcie_cap_exit(dev);
++    }
++
+     return 0;
+ }
+ 
+-
+-static  VMStateDescription vmstate_pci_fake = {
++static VMStateDescription vmstate_pci_fake = {
+     .name = "fakepci",
+     .version_id = 3,
+     .minimum_version_id = 3,
+@@ -139,6 +189,16 @@ static  VMStateDescription vmstate_pci_fake = {
+     }
+ };
+ 
++static VMStateDescription vmstate_pcie_fake = {
++    .name = "fakepci",
++    .version_id = 3,
++    .minimum_version_id = 3,
++    .minimum_version_id_old = 3,
++    .fields      = (VMStateField []) {
++        VMSTATE_PCIE_DEVICE(dev, PCIFakeState),
++        VMSTATE_END_OF_LIST()
++    }
++};
+ 
+ static Property fakepci_properties[] = {
+     DEFINE_PROP_END_OF_LIST(),
+@@ -149,6 +209,11 @@ static void fakepci_class_init(ObjectClass *klass, void *data)
+     DeviceClass *dc = DEVICE_CLASS(klass);
+     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
+ 
++    // PCI-E support
++    if (s_fake_pci->cap_pcie > 0) {
++        k->is_express = 1;
++    }
++
+     k->init = pci_fake_init;
+     k->exit = pci_fake_uninit;
+ 
+@@ -159,7 +224,12 @@ static void fakepci_class_init(ObjectClass *klass, void *data)
+     k->subsystem_vendor_id = s_fake_pci->ss_vendor_id;
+     k->subsystem_id = s_fake_pci->ss_id;
+ 
+-    dc->vmsd = &vmstate_pci_fake;
++    if (s_fake_pci->cap_pcie > 0) {
++        dc->vmsd = &vmstate_pcie_fake;
++    } else {
++        dc->vmsd = &vmstate_pci_fake;
++    }
++
+     dc->props = fakepci_properties;
+ }
+ 
+@@ -200,7 +270,11 @@ void fakepci_register_device(fake_pci_t *fake)
+ 
+ 
+     fakepci_info.name = s_fake_pci->name;
++
++    // Just assign both -- we'll only actually use one of these though
++    vmstate_pcie_fake.name = s_fake_pci->name;
+     vmstate_pci_fake.name = s_fake_pci->name;
++    
+     type_register_static(&fakepci_info);
+ }
+ 
+diff --git a/qemu/hw/fakepci.h b/qemu/hw/fakepci.h
+index 7dda80d..56e34ff 100644
+--- a/qemu/hw/fakepci.h
++++ b/qemu/hw/fakepci.h
+@@ -16,6 +16,10 @@ typedef struct _fake_pci_t {
+     int num_resources;
+     PCIIORegion resources[PCI_NUM_REGIONS];
+     int mmioidx;
++
++    int cap_pm;
++    int cap_msi;
++    int cap_pcie;
+ }fake_pci_t;
+ 
+ enum fake_bus_type_t {
+diff --git a/qemu/hw/pci.c b/qemu/hw/pci.c
+index e149305..d6f06ef 100644
+--- a/qemu/hw/pci.c
++++ b/qemu/hw/pci.c
+@@ -1566,6 +1566,7 @@ PCIDevice *pci_create_simple(PCIBus *bus, int devfn, const char *name)
+     return pci_create_simple_multifunction(bus, devfn, false, name);
+ }
+ 
++/*
+ static int pci_find_space(PCIDevice *pdev, uint8_t size)
+ {
+     int config_size = pci_config_size(pdev);
+@@ -1578,6 +1579,23 @@ static int pci_find_space(PCIDevice *pdev, uint8_t size)
+             return offset;
+     return 0;
+ }
++*/
++static int pci_find_space(PCIDevice *pdev, uint8_t size)
++{
++    int config_size = pci_config_size(pdev);
++    int offset = PCI_CONFIG_HEADER_SIZE;
++    int i;
++    int masked;
++    for (i = PCI_CONFIG_HEADER_SIZE; i < config_size; ++i) {
++        masked = i & (~3);
++        if (pdev->used[i]) {
++            offset = masked + 4;
++        } else if (i - offset + 1 == size) {
++            return offset;
++        }
++    }
++    return 0;
++}
+ 
+ static uint8_t pci_find_capability_list(PCIDevice *pdev, uint8_t cap_id,
+                                         uint8_t *prev_p)
+diff --git a/qemu/llvm-lib.h b/qemu/llvm-lib.h
+index 76a47b1..43e7dfb 100644
+--- a/qemu/llvm-lib.h
++++ b/qemu/llvm-lib.h
+@@ -48,7 +48,8 @@ uint8_t klee_int8(const char *name);
+ uint16_t klee_int16(const char *name);
+ uint32_t klee_int32(const char *name);
+ void uint32_to_string(uint32_t n, char *str);
+-void trace_port(char *buf, const char *prefix, uint32_t port, uint32_t pc);
++
++void trace_port(char *buf, const char *prefix, uint32_t port, uint32_t pc, uint32_t unique_id /* MJR */);
+ 
+ uint8_t klee_int8(const char *name) {
+     uint8_t ret;
+@@ -83,7 +84,7 @@ void uint32_to_string(uint32_t n, char *str)
+   str[7] = hextable[((n >> 0) & 0xF)];
+ }
+ 
+-void trace_port(char *buf, const char *prefix, uint32_t port, uint32_t pc)
++void trace_port(char *buf, const char *prefix, uint32_t port, uint32_t pc, uint32 unique_id /* MJR */)
+ {
+     while(*prefix) {
+         *buf = *prefix;
+@@ -94,8 +95,14 @@ void trace_port(char *buf, const char *prefix, uint32_t port, uint32_t pc)
+     buf+=8;
+     *buf = '_';
+     buf++;
++
+     uint32_to_string(pc, buf);
+     buf+=8;
++    *buf = '_';
++    buf++;
++
++    uint32_to_string(unique_id, buf);
++    buf+=8;
+     *buf = 0;
+ }
+ 
+diff --git a/qemu/qemu-options.hx b/qemu/qemu-options.hx
+index 6454b85..ec77009 100644
+--- a/qemu/qemu-options.hx
++++ b/qemu/qemu-options.hx
+@@ -68,6 +68,15 @@ DEF("fake-pci-resource-mem-prefetch", HAS_ARG, QEMU_OPTION_fake_pci_resource_mem
+ DEF("fake-pci-resource-rom", HAS_ARG, QEMU_OPTION_fake_pci_resource_rom,
+     "fake-pci-resource-rom\n", QEMU_ARCH_ALL)
+ 
++DEF("fake-pci-cap-pm", HAS_ARG, QEMU_OPTION_fake_pci_cap_pm,
++    "fake-pci-cap-pm\n", QEMU_ARCH_ALL)
++
++DEF("fake-pci-cap-msi", HAS_ARG, QEMU_OPTION_fake_pci_cap_msi,
++    "fake-pci-cap-msi\n", QEMU_ARCH_ALL)
++
++DEF("fake-pci-cap-pcie", HAS_ARG, QEMU_OPTION_fake_pci_cap_pcie,
++    "fake-pci-cap-pcie\n", QEMU_ARCH_ALL)
++
+ #endif
+ 
+ 
+diff --git a/qemu/s2e/MMUFunctionHandlers.cpp b/qemu/s2e/MMUFunctionHandlers.cpp
+index 99e3f19..37822e3 100644
+--- a/qemu/s2e/MMUFunctionHandlers.cpp
++++ b/qemu/s2e/MMUFunctionHandlers.cpp
+@@ -66,16 +66,37 @@ namespace s2e {
+ //XXX: Fix this
+ #define CPU_MMU_INDEX 0
+ 
++#define MJR_TRACE(ADDRESS, VALUE, WIDTH, ISWRITE, ISDMA)                \
++    do {                                                                \
++        std::vector<ref<Expr> > traceArgs;                              \
++        traceArgs.push_back(ADDRESS);                                   \
++        traceArgs.push_back(VALUE);                                     \
++        traceArgs.push_back(ConstantExpr::create(WIDTH, Expr::Int64));  \
++        traceArgs.push_back(ConstantExpr::create(ISWRITE, Expr::Int64)); \
++        if (!(ISDMA)) {                                                 \
++            S2EExecutor::handlerTraceMemoryAccess(g_s2e->getExecutor(), state, target, traceArgs); \
++        } else {                                                        \
++            S2EExecutor::handlerTraceDMAAccess(g_s2e->getExecutor(), state, target, traceArgs); \
++        }                                                               \
++    } while (0)
++    
+ //This is an io_write_chkX_mmu function
+ static void io_write_chk(S2EExecutionState *state,
+                              target_phys_addr_t physaddr,
+                              ref<Expr> val,
+                              target_ulong addr,
+-                             void *retaddr, Expr::Width width)
++                             void *retaddr,
++                             Expr::Width width, // MJR width in bits
++                             klee::KInstruction* target, // MJR
++                             ref<Expr> symbAddress) // MJR
+ {
+     target_phys_addr_t origaddr = physaddr;
+     MemoryRegion *mr = iotlb_to_region(physaddr);
+ 
++    // MJR naddr is phys addr in VM, added these two lines:
++    target_ulong naddr = (physaddr & TARGET_PAGE_MASK)+addr;
++    int isDMASymb = g_s2e->getCorePlugin()->isMmioSymbolic(naddr, width / 8);
++
+     physaddr = (physaddr & TARGET_PAGE_MASK) + addr;
+     if (mr != &io_mem_ram && mr != &io_mem_rom
+         && mr != &io_mem_unassigned
+@@ -84,17 +105,27 @@ static void io_write_chk(S2EExecutionState *state,
+         cpu_io_recompile(env, retaddr);
+     }
+ 
+-
+     env->mem_io_vaddr = addr;
+     env->mem_io_pc = (uintptr_t)retaddr;
+ #ifdef TARGET_WORDS_BIGENDIAN
+     #error This is not implemented yet.
+ #else
+     if (s2e_ismemfunc(mr, 1)) {
++        // MJR isWrite = 1
++        // MJR isDMA = 1
++        if (isDMASymb) { // MJR added this block
++            MJR_TRACE(symbAddress, val, width, 1, 1); // MJR
++        }
+         uintptr_t pa = s2e_notdirty_mem_write(physaddr);
+         state->writeMemory(pa, val, S2EExecutionState::HostAddress);
+         return;
+     }
++    if (s2e_issymfunc(mr, addr)) { // MJR added this block
++        // MJR isWrite = 1
++        // MJR isDMA = 0
++        MJR_TRACE(symbAddress, val, width, 1, 0); // MJR
++        return; // All done -- no need to "write" to symbolic memory ?? MJR maybe?
++    }
+ #endif
+ 
+     //XXX: Check if MMIO is symbolic, and add corresponding trace entry
+@@ -119,19 +150,25 @@ static void io_write_chk(S2EExecutionState *state,
+ static ref<Expr> io_read_chk(S2EExecutionState *state,
+                              target_phys_addr_t physaddr,
+                              target_ulong addr,
+-                             void *retaddr, Expr::Width width)
++                             void *retaddr, Expr::Width width, // MJR width in bits
++                             klee::KInstruction* target, // MJR
++                             ref<Expr> symbAddress) // MJR
+ {
+     ref<Expr> res;
+     target_phys_addr_t origaddr = physaddr;
+     MemoryRegion *mr = iotlb_to_region(physaddr);
+ 
+     target_ulong naddr = (physaddr & TARGET_PAGE_MASK)+addr;
+-    int isSymb = g_s2e->getCorePlugin()->isMmioSymbolic(naddr, width / 8);;
++    int isDMASymb = g_s2e->getCorePlugin()->isMmioSymbolic(naddr, width / 8); // MJR naddr is phys addr in VM
++    int isSymb = s2e_issymfunc(mr, addr); // MJR
+     std::stringstream ss;
+     if (isSymb) {
+         //If at least one byte is symbolic, generate a label
+         ss << "iommuread_" << hexval(naddr) << "@" << hexval(env->eip);
+     }
++    if (isDMASymb) { // MJR added this
++        ss << "dmaread_" << hexval(naddr) << "@" << hexval(env->eip);
++    }
+ 
+     //If it is not DMA, then check if it is normal memory
+     env->mem_io_pc = (uintptr_t)retaddr;
+@@ -143,12 +180,27 @@ static ref<Expr> io_read_chk(S2EExecutionState *state,
+     }
+ 
+     env->mem_io_vaddr = addr;
+-    if (s2e_ismemfunc(mr, 0)) {
+-        uintptr_t pa = s2e_notdirty_mem_write(physaddr);
+-        if (isSymb) {
+-            return state->createSymbolicValue(ss.str(), width);
++    //if (s2e_ismemfunc(mr, 0)) { // MJR
++        if (isDMASymb) { // MJR modified this block
++            // MJR isWrite = 0
++            // MJR isDMA = 1
++            ref<Expr> symbolicResult = state->createSymbolicValue(ss.str(), width);
++            MJR_TRACE(symbAddress, symbolicResult, width, 0, 1); // MJR
++            g_s2e->getCorePlugin()->establishIOMap (ss.str()); // MJR
++            return symbolicResult;
+         }
+-        return state->readMemory(pa, width, S2EExecutionState::HostAddress);
++// MJR
++//        uintptr_t pa = s2e_notdirty_mem_write(physaddr); // MJR moved this
++//        return state->readMemory(pa, width, S2EExecutionState::HostAddress);
++//    }
++
++    if (isSymb) { // MJR added this block
++        // MJR isWrite = 0
++        // MJR isDMA = 0
++        ref<Expr> symbolicResult = state->createSymbolicValue(ss.str(), width);
++        MJR_TRACE(symbAddress, symbolicResult, width, 0, 0); // MJR
++        g_s2e->getCorePlugin()->establishIOMap (ss.str()); // MJR
++        return symbolicResult;
+     }
+ 
+     //By default, call the original io_read function, which is external
+@@ -284,9 +336,12 @@ ref<Expr> S2EExecutor::handle_ldst_mmu(Executor* executor,
+             ioaddr = env->iotlb[mmu_idx][index];
+ 
+             if (!isWrite)
+-                value = io_read_chk(s2estate, ioaddr, addr, retaddr, width);
++                // MJR Added symbAddress
++                value = io_read_chk(s2estate, ioaddr, addr, retaddr, width, target, symbAddress);
+ 
+             //Trace the access
++            /*
++              MJR
+             std::vector<ref<Expr> > traceArgs;
+             traceArgs.push_back(symbAddress);
+             traceArgs.push_back(ConstantExpr::create(addr + ioaddr, Expr::Int64));
+@@ -295,9 +350,11 @@ ref<Expr> S2EExecutor::handle_ldst_mmu(Executor* executor,
+             traceArgs.push_back(ConstantExpr::create(isWrite, Expr::Int64)); //isWrite
+             traceArgs.push_back(ConstantExpr::create(1, Expr::Int64)); //isIO
+             handlerTraceMemoryAccess(executor, state, target, traceArgs);
++            */
+ 
+            if (isWrite)
+-               io_write_chk(s2estate, ioaddr, value, addr, retaddr, width);
++               // MJR Added symbAddress
++               io_write_chk(s2estate, ioaddr, value, addr, retaddr, width, target, symbAddress);
+ 
+         } else if (unlikely(((addr & ~S2E_RAM_OBJECT_MASK) + data_size - 1) >= S2E_RAM_OBJECT_SIZE)) {
+             /* slow unaligned access (it spans two pages or IO) */
+@@ -356,6 +413,8 @@ ref<Expr> S2EExecutor::handle_ldst_mmu(Executor* executor,
+             }
+ 
+             //Trace the access
++            /*
++              MJR
+             std::vector<ref<Expr> > traceArgs;
+             traceArgs.push_back(symbAddress);
+             traceArgs.push_back(ConstantExpr::create(addr + addend, Expr::Int64));
+@@ -364,6 +423,7 @@ ref<Expr> S2EExecutor::handle_ldst_mmu(Executor* executor,
+             traceArgs.push_back(ConstantExpr::create(isWrite, Expr::Int64)); //isWrite
+             traceArgs.push_back(ConstantExpr::create(0, Expr::Int64)); //isIO
+             handlerTraceMemoryAccess(executor, state, target, traceArgs);
++            */
+        }
+     } else {
+         /* the page is not in the TLB : fill it */
+@@ -491,6 +551,8 @@ void S2EExecutor::handle_ldst_kernel(Executor* executor,
+         }
+ 
+         //Trace the access
++        /*
++          MJR
+         std::vector<ref<Expr> > traceArgs;
+         traceArgs.push_back(constantAddress);
+         traceArgs.push_back(ConstantExpr::create(physaddr, Expr::Int64));
+@@ -499,6 +561,7 @@ void S2EExecutor::handle_ldst_kernel(Executor* executor,
+         traceArgs.push_back(ConstantExpr::create(isWrite, Expr::Int64)); //isWrite
+         traceArgs.push_back(ConstantExpr::create(0, Expr::Int64)); //isIO
+         handlerTraceMemoryAccess(executor, state, target, traceArgs);
++        */
+ 
+         if (!isWrite) {
+             if (zeroExtend) {
+diff --git a/qemu/s2e/Plugins/BaseInstructions.cpp b/qemu/s2e/Plugins/BaseInstructions.cpp
+index 97308d5..547aa7f 100644
+--- a/qemu/s2e/Plugins/BaseInstructions.cpp
++++ b/qemu/s2e/Plugins/BaseInstructions.cpp
+@@ -169,6 +169,51 @@ void BaseInstructions::isSymbolic(S2EExecutionState *state)
+ 
+ void BaseInstructions::killState(S2EExecutionState *state)
+ {
++    // SymDrive implementation
++    std::string message;
++    uint32_t messagePtr;
++    bool ok = true;
++    klee::ref<klee::Expr> kill_all = state->readCpuRegister(CPU_OFFSET(regs[R_EAX]), klee::Expr::Int32);
++    klee::ref<klee::Expr> status = state->readCpuRegister(CPU_OFFSET(regs[R_EBX]), klee::Expr::Int32);
++    ok &= state->readCpuRegisterConcrete(CPU_OFFSET(regs[R_ECX]), &messagePtr, 4);
++
++    if (!ok) {
++        s2e()->getWarningsStream(state)
++            << "ERROR: symbolic argument was passed to s2e_op kill state\n";
++    } else {
++        message="<NO MESSAGE>";
++        if(!messagePtr || !state->readString(messagePtr, message)) {
++            s2e()->getWarningsStream(state)
++                << "s2e_kill_state:  error reading message string from the guest\n";
++        }
++    }
++
++    bool isKillAllCste = isa<klee::ConstantExpr>(kill_all);
++    int i_kill_all = isKillAllCste ? cast<klee::ConstantExpr>(kill_all)->getZExtValue(64) : 0;
++    if (i_kill_all == 0) {
++        if (s2e()->getExecutor()->getStatesCount() == 1) {
++            s2e()->getWarningsStream(state) << "Not killing state " << state->getID()
++                                            << " since it's the only one!\n";
++            s2e()->getWarningsStream(state) << "Message from guest: \"" << message << "\"\n"
++                                            << "status: " << status << "\n";
++            return;
++        }
++    }
++
++    //Kill the current state                                                                                
++    s2e()->getWarningsStream(state) << "Killing state "  << state->getID() << "\n";
++    std::ostringstream os;
++    os << "State was terminated by opcode\n"
++       << "            message: \"" << message << "\"\n"
++       << "            status: " << status << "\n";
++    s2e()->getWarningsStream(state) << "Message: " << os;
++    s2e()->getExecutor()->terminateStateEarly(*state, os.str());
++    return;
++}
++
++// SymDrive: original implementation
++/*
++{
+     std::string message;
+     uint32_t messagePtr;
+     bool ok = true;
+@@ -194,6 +239,7 @@ void BaseInstructions::killState(S2EExecutionState *state)
+        << "            status: " << status;
+     s2e()->getExecutor()->terminateStateEarly(*state, os.str());
+ }
++*/
+ 
+ void BaseInstructions::printExpression(S2EExecutionState *state)
+ {
+@@ -287,6 +333,136 @@ void BaseInstructions::concretize(S2EExecutionState *state, bool addConstraint)
+     }
+ }
+ 
++void BaseInstructions::detectIntOverflow(S2EExecutionState *state)
++{
++	uint32_t op1_addr, op2_addr, size, flag;
++	uint64_t buf;
++	bool ok = true;
++
++	ok &= state->readCpuRegisterConcrete(CPU_OFFSET(regs[R_EAX]), &op1_addr, 4);
++	ok &= state->readCpuRegisterConcrete(CPU_OFFSET(regs[R_EBX]), &op2_addr, 4);
++	ok &= state->readCpuRegisterConcrete(CPU_OFFSET(regs[R_ECX]), &flag, 4);
++	ok &= state->readCpuRegisterConcrete(CPU_OFFSET(regs[R_EDX]), &size, 4);
++
++	if (!ok) {
++		s2e()->getWarningsStream(state) 
++			<< "ERROR: symbolic argument was passed to s2e_op"
++			<< " detectIntOverflow opcode\n";
++		return;
++	}
++	
++	unsigned opsize;
++	switch(size){
++		case 1:
++			opsize = klee::Expr::Int8;
++			break;
++		case 2:
++			opsize = klee::Expr::Int16;
++			break;
++		case 4:
++			opsize = klee::Expr::Int32;
++			break;
++		case 8:
++			opsize = klee::Expr::Int64;
++			break;
++		default:
++			s2e()->getWarningsStream(state) << "ERROR: SIZE passed to s2e_detect_int is WRONG!\n";
++			break;
++	}
++	//klee::ref<klee::Expr> op1 = state->readMemory(op1_addr, klee::Expr::Int32);
++	//klee::ref<klee::Expr> op2 = state->readMemory(op2_addr, klee::Expr::Int32);
++	bool result = !state->readMemoryConcrete(op1_addr, &buf, 1) | !state->readMemoryConcrete(op2_addr, &buf, 1);
++	if (!result){
++		//s2e()->getWarningsStream() << "---These ops are not symbolic!\n";
++		return;
++	}
++	klee::ref<klee::Expr> op1 = state->readMemory(op1_addr, opsize);
++	klee::ref<klee::Expr> op2 = state->readMemory(op2_addr, opsize);
++	klee::ref<klee::Expr> cond;
++	klee::ref<klee::Expr> zero = klee::ConstantExpr::create(0, opsize);
++
++	s2e()->getMessagesStream() << "-----op1-----\n" << op1 << '\n' << "-----\n";
++	s2e()->getMessagesStream() << "-----op2-----\n" << op2 << '\n' << "-----\n";
++
++	switch(flag) {
++		case 0: //uadd
++			cond = klee::UltExpr::create(klee::AddExpr::create(op1, op2), op1);
++			break;
++		case 1: //sadd
++			cond = klee::SltExpr::create(klee::AndExpr::create(klee::XorExpr::create(klee::AddExpr::create(op1, op2), op1), klee::XorExpr::create(klee::AddExpr::create(op1, op2), op2)), zero);
++			break;
++		case 2: //usub
++			cond = klee::UltExpr::create(op1, op2);
++			break;
++		case 3: //ssub
++			cond = klee::SltExpr::create(klee::AndExpr::create(klee::XorExpr::create(klee::SubExpr::create(op1, op2), op1), klee::XorExpr::create(op1, op2)), zero);
++			break;	
++		case 4: //umul
++			cond = klee::AndExpr::create(klee::NeExpr::create(op2, zero), klee::UltExpr::create(klee::UDivExpr::create(klee::SubExpr::create(zero, klee::ConstantExpr::create(1, opsize)), op2), op1));
++			break;
++		case 5: //smul
++			if (opsize == klee::Expr::Int64){
++				s2e()->getMessagesStream(state) << "TODO: not supply 64 smul detect!\n";
++				return;
++			}
++			cond = klee::NeExpr::create(klee::ExtractExpr::create(klee::AShrExpr::create(klee::MulExpr::create(klee::SExtExpr::create(op1, 2*opsize), klee::SExtExpr::create(op2, 2*opsize)), klee::ConstantExpr::create((int)opsize, opsize)), 0, opsize), klee::AShrExpr::create(klee::ExtractExpr::create(klee::MulExpr::create(klee::SExtExpr::create(op1, 2*opsize), klee::SExtExpr::create(op2, 2*opsize)), 0, opsize), klee::ConstantExpr::create((int)opsize - 1, opsize)));	
++			break;
++		case 6: //udiv s2e_kill_state?
++			cond = klee::EqExpr::create(op2, zero);
++			break;
++		case 7: //sdiv
++			cond = klee::OrExpr::create(klee::EqExpr::create(op2, zero), klee::AndExpr::create(klee::EqExpr::create(op1, klee::ShlExpr::create(klee::ConstantExpr::create(1, opsize), klee::ConstantExpr::create((int)opsize - 1, opsize))), klee::EqExpr::create(op2, klee::SubExpr::create(zero, klee::ConstantExpr::create(1, opsize)))));
++			break;
++		case 8: //shl
++			cond = klee::UleExpr::create(klee::ConstantExpr::create((int)opsize, opsize), op2);
++			break;
++		case 9: //lshr
++			cond = klee::UleExpr::create(klee::ConstantExpr::create((int)opsize, opsize), op2);
++			break;
++		case 10: //ashr
++			cond = klee::UleExpr::create(klee::ConstantExpr::create((int)opsize, opsize), op2);
++			break;	
++		case 11: //array
++		       cond = klee::UleExpr::create(op2, op1);	
++		       break;
++		case 12: //size
++		       cond = klee::SltExpr::create(op1, zero);
++		       break;
++		default:
++			break;
++	}
++
++	s2e()->getMessagesStream() << "-----condition-----\n" << cond << '\n' << "-----\n";
++	
++	bool isTrue;
++	if (!(s2e()->getExecutor()->getSolver()->mayBeTrue(klee::Query(state->constraints, cond), isTrue)))
++		s2e()->getWarningsStream() << "Failed to assert the condition\n";
++	if (isTrue){
++		ConcreteInputs inputs;
++		ConcreteInputs::iterator it;
++
++		ConstraintManager constraints_before(state->constraints);
++		//ConstraintManager *p_constraints;
++		//p_constraints = &state->constraints;
++
++		s2e()->getExecutor()->addConstraint(*state, cond);
++		s2e()->getExecutor()->getSymbolicSolution(*state, inputs);
++
++		s2e()->getMessagesStream() << "==================\n" <<"there is a BUG here!\n" << "==================\n" << "values:\n";
++		for (it = inputs.begin(); it != inputs.end(); ++it){
++			const VarValuePair &vp = *it; 
++			s2e()->getMessagesStream() << "-----\n" << vp.first << " : ";
++			for (int i = 0; i != vp.second.size(); ++i)
++				s2e()->getMessagesStream() << hexval((unsigned char) vp.second[i]) << " ";
++			s2e()->getMessagesStream() << '\n';
++		}
++		s2e()->getMessagesStream() << "==================\n";
++
++		//p_constraints->clear();
++		state->constraints = constraints_before;
++	}
++}
++
+ void BaseInstructions::sleep(S2EExecutionState *state)
+ {
+     uint32_t duration = 0;
+@@ -317,18 +493,20 @@ void BaseInstructions::printMessage(S2EExecutionState *state, bool isWarning)
+     }
+ 
+     std::string str="";
+-    if(!address || !state->readString(address, str)) {
++    if(!address || !state->readString(address, str, 4096)) { // SymDrive: added 4096 as maxlen, default is 256
+         s2e()->getWarningsStream(state)
+                 << "Error reading string message from the guest at address "
+-                << hexval(address) << '\n';
+-    } else {
++                << hexval(address) << ", printing partial message:" << '\n'; // SymDrive
++    } /* SymDrive else */ {
+         llvm::raw_ostream *stream;
+         if(isWarning)
+             stream = &s2e()->getWarningsStream(state);
+         else
+             stream = &s2e()->getMessagesStream(state);
+-        (*stream) << "Message from guest (" << hexval(address) <<
+-                     "): " <<  str << '\n';
++
++        (*stream) << "Guest: " <<  str; // SymDrive
++        //(*stream) << "Message from guest (" << hexval(address) <<
++        //    "): " <<  str /* SymDrive << '\n' */;
+     }
+ }
+ 
+@@ -517,6 +695,11 @@ void BaseInstructions::handleBuiltInOps(S2EExecutionState* state, uint64_t opcod
+             s2e()->getExecutor()->queueStateForMerge(state);
+             break;
+ 
++		case 0x80: /* s2e_detect_int */
++			detectIntOverflow(state);
++			break;
++			
++
+         default:
+             s2e()->getWarningsStream(state)
+                 << "BaseInstructions: Invalid built-in opcode " << hexval(opcode) << '\n';
+@@ -528,7 +711,7 @@ void BaseInstructions::onCustomInstruction(S2EExecutionState* state,
+         uint64_t opcode)
+ {
+     uint8_t opc = (opcode>>8) & 0xFF;
+-    if (opc <= 0x70) {
++    if (opc <= 0x70 || opc == 0x80) { //fwl added
+         handleBuiltInOps(state, opcode);
+     }
+ }
+diff --git a/qemu/s2e/Plugins/BaseInstructions.h b/qemu/s2e/Plugins/BaseInstructions.h
+index f398e63..73a066f 100644
+--- a/qemu/s2e/Plugins/BaseInstructions.h
++++ b/qemu/s2e/Plugins/BaseInstructions.h
+@@ -56,6 +56,10 @@ public:
+     void handleBuiltInOps(S2EExecutionState* state, 
+         uint64_t opcode);
+ 
++	//fwl add
++	typedef std::pair<std::string, std::vector<unsigned char> > VarValuePair;
++	typedef std::vector<VarValuePair> ConcreteInputs;
++	
+ private:
+     void onCustomInstruction(S2EExecutionState* state, 
+         uint64_t opcode);
+@@ -68,6 +72,7 @@ private:
+     void printMemory(S2EExecutionState *state);
+     void concretize(S2EExecutionState *state, bool addConstraint);
+     void sleep(S2EExecutionState *state);
++	 void detectIntOverflow(S2EExecutionState *state); //fwl add 
+ };
+ 
+ class BaseInstructionsPluginInvokerInterface {
+diff --git a/qemu/s2e/Plugins/CorePlugin.cpp b/qemu/s2e/Plugins/CorePlugin.cpp
+index c0d9ad9..89cad5d 100644
+--- a/qemu/s2e/Plugins/CorePlugin.cpp
++++ b/qemu/s2e/Plugins/CorePlugin.cpp
+@@ -328,6 +328,7 @@ void s2e_init_timers(S2E* s2e)
+     s2e->getCorePlugin()->initializeTimers();
+ }
+ 
++#if 0 // SymDrive
+ static void s2e_trace_memory_access_slow(
+         uint64_t vaddr, uint64_t haddr, uint8_t* buf, unsigned size,
+         int isWrite, int isIO)
+@@ -358,6 +359,56 @@ void s2e_trace_memory_access(
+         s2e_trace_memory_access_slow(vaddr, haddr, buf, size, isWrite, isIO);
+     }
+ }
++#endif
++
++void s2e_trace_memory_access(
++    struct S2E *s2e, struct S2EExecutionState* state,
++    uint64_t vaddr, uint8_t* buf, unsigned size, int isWrite)
++{
++/* // SymDrive
++   if(!s2e->getCorePlugin()->onDataMemoryAccess.empty()) {
++   uint64_t value = 0;
++   memcpy((void*) &value, buf, size);
++
++   try {
++   s2e->getCorePlugin()->onDataMemoryAccess.emit(state,
++   klee::ConstantExpr::create(vaddr, 64),
++   klee::ConstantExpr::create(haddr, 64),
++   klee::ConstantExpr::create(value, size*8),
++   isWrite, isIO != 0 ? true : false); // SymDrive tweaked
++   } catch(s2e::CpuExitException&) {
++   longjmp(env->jmp_env, 1);
++   }
++   }
++*/
++
++    // SymDrive, added this:
++    if(/* isIO == 2 && */!g_s2e->getCorePlugin()->onIOMemoryAccess.empty()) {
++
++        try {
++            // Parameters to onIOMemoryAccess.
++            // Address:
++            klee::ref<klee::Expr> eAddress = klee::ConstantExpr::create(vaddr, 64);
++
++            // Data / size:
++            uint64_t value = 0;
++            memcpy((void*) &value, buf, size);
++            klee::ref<klee::Expr> eValue = klee::ConstantExpr::create(value, size*8);
++            int accessType = 1; // MMIO
++            g_s2e->getCorePlugin()->onIOMemoryAccess.emit(
++                state,
++                accessType,
++                eAddress,
++                eValue,
++                size,
++                isWrite);
++            g_s2e->getMessagesStream() << "s2e_trace_memory_access: Finished I/O memory access\n";
++        } catch(s2e::CpuExitException&) {
++            g_s2e->getMessagesStream() << "s2e_trace_memory_access: Caught CPUExitException\n";
++            s2e_longjmp(env->jmp_env, 1);
++        }
++    }
++}
+ 
+ void s2e_on_page_fault(S2E *s2e, S2EExecutionState* state, uint64_t addr, int is_write)
+ {
+@@ -393,6 +444,7 @@ void s2e_trace_port_access(
+         uint64_t port, uint64_t value, unsigned size,
+         int isWrite)
+ {
++/* SymDrive commented
+     if(!s2e->getCorePlugin()->onPortAccess.empty()) {
+         try {
+             s2e->getCorePlugin()->onPortAccess.emit(state,
+@@ -403,6 +455,29 @@ void s2e_trace_port_access(
+             s2e_longjmp(env->jmp_env, 1);
+         }
+     }
++*/
++    // SymDrive added this:
++    if(!s2e->getCorePlugin()->onIOMemoryAccess.empty()) {
++        try {
++            // We're ignoring host addr
++            // Parameters to onIOMemoryAccess:
++            int accessType = 0; // Port I/O
++            klee::ref<klee::Expr> eAddress = klee::ConstantExpr::create(port, 64);
++            klee::ref<klee::Expr> eValue = klee::ConstantExpr::create(value, 64);
++
++            s2e->getCorePlugin()->onIOMemoryAccess.emit(
++                state,
++                accessType,
++                eAddress, // vaddr
++                eValue,   // value
++                size,     // size in bytes
++                isWrite); // isWrite
++            s2e->getMessagesStream() << "s2e_trace_port_access: Finished port access\n";
++        } catch(s2e::CpuExitException&) {
++            s2e->getMessagesStream() << "s2e_trace_port_access: Caught CPUExitException\n";
++            s2e_longjmp(env->jmp_env, 1);
++        }
++    }
+ }
+ 
+ int s2e_is_port_symbolic(struct S2E *s2e, struct S2EExecutionState* state, uint64_t port)
+@@ -482,3 +557,45 @@ void s2e_on_monitor_event(QDict *event)
+     g_s2e->getCorePlugin()->onMonitorEvent.emit(event, pluginData);
+     qdict_put(event, "s2e-event", pluginData);
+ }
++
++// SymDrive added this chunk / copied from llvm-lib.h (with tweaks)
++static char SymDrive_hextable[] = {'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b',
++                          'c', 'd', 'e', 'f'};
++static inline void SymDrive_uint32_to_string(uint32_t n, char *str)
++{
++    str[0] = SymDrive_hextable[(n >> 28)];
++    str[1] = SymDrive_hextable[((n >> 24) & 0xF)];
++    str[2] = SymDrive_hextable[((n >> 20) & 0xF)];
++    str[3] = SymDrive_hextable[((n >> 16) & 0xF)];
++    str[4] = SymDrive_hextable[((n >> 12) & 0xF)];
++    str[5] = SymDrive_hextable[((n >> 8) & 0xF)];
++    str[6] = SymDrive_hextable[((n >> 4) & 0xF)];
++    str[7] = SymDrive_hextable[((n >> 0) & 0xF)];
++    str[8] = 0;
++}
++
++// SymDrive added this ---------->
++void s2e_establishIOMap(int prefix, uint32_t port, uint32_t pc, uint32_t unique_id)
++{
++    std::stringstream label;
++    if (prefix == 1) {
++        label << "inb";
++    } else if (prefix == 2) {
++        label << "inw";
++    } else  if (prefix == 3) {
++        label << "inl";
++    } else {
++        assert (false && "Specify a valid prefix");
++    }
++
++    // Make the formatting identical to the one outline in op_helper.c
++    char str[9];
++    SymDrive_uint32_to_string(port, str);
++    label << str << "_";
++    SymDrive_uint32_to_string(pc, str);
++    label << str << "_";
++    SymDrive_uint32_to_string(unique_id, str);
++    label << str;
++    g_s2e->getCorePlugin()->establishIOMap(label.str());
++}
++/////////////////// <---------- SymDrive
+diff --git a/qemu/s2e/Plugins/CorePlugin.h b/qemu/s2e/Plugins/CorePlugin.h
+index 3d3732c..b09bfb7 100644
+--- a/qemu/s2e/Plugins/CorePlugin.h
++++ b/qemu/s2e/Plugins/CorePlugin.h
+@@ -65,6 +65,7 @@ typedef sigc::signal<void, S2EExecutionState*, uint64_t /* pc */> ExecutionSigna
+   * This is necessary tp speedup checks (and avoid using signals) */
+ typedef bool (*SYMB_PORT_CHECK)(uint16_t port, void *opaque);
+ typedef bool (*SYMB_MMIO_CHECK)(uint64_t physaddress, uint64_t size, void *opaque);
++typedef bool (*ESTABLISH_IO_MAP_FN)(std::string origin, void *opaque); // SymDrive added
+ 
+ class CorePlugin : public Plugin {
+     S2E_PLUGIN
+@@ -76,6 +77,10 @@ private:
+     void *m_isPortSymbolicOpaque;
+     void *m_isMmioSymbolicOpaque;
+ 
++    // SymDrive added:
++    ESTABLISH_IO_MAP_FN m_establishIOMap;
++    void *m_establishIOMapOpaque;
++
+ public:
+     CorePlugin(S2E* s2e): Plugin(s2e) {
+         m_Timer = NULL;
+@@ -83,6 +88,7 @@ public:
+         m_isMmioSymbolicCb = NULL;
+         m_isPortSymbolicOpaque = NULL;
+         m_isMmioSymbolicOpaque = NULL;
++        m_establishIOMap = NULL; // SymDrive
+     }
+ 
+     void initialize();
+@@ -98,6 +104,11 @@ public:
+         m_isMmioSymbolicOpaque = opaque;
+     }
+ 
++    void setIoMapCallback(ESTABLISH_IO_MAP_FN cb, void *opaque) { // SymDrive added this fn
++        m_establishIOMap = cb;
++        m_establishIOMapOpaque = opaque;
++    }
++
+     inline bool isPortSymbolic(uint16_t port) const {
+         if (m_isPortSymbolicCb) {
+             return m_isPortSymbolicCb(port, m_isPortSymbolicOpaque);
+@@ -112,6 +123,13 @@ public:
+         return false;
+     }
+ 
++    inline bool establishIOMap(std::string tag) const { // SymDrive added
++        if (m_establishIOMap) {
++            return m_establishIOMap(tag, m_establishIOMapOpaque);
++        }
++        return false;
++    }
++
+     struct QEMUTimer *getTimer() {
+         return m_Timer;
+     }
+@@ -187,6 +205,17 @@ public:
+                  bool /* isWrite */, bool /* isIO */>
+             onDataMemoryAccess;
+ 
++    /** Signal that is emitted on each I/O memory access */
++    // SymDrive, added this:
++    sigc::signal<void,
++        S2EExecutionState*,     /* state */
++        int,                    /* access type */
++        klee::ref<klee::Expr>,  /* virtualAddress */
++        klee::ref<klee::Expr>,  /* value */
++        int,                    /* size in bytes */
++        bool>                   /* isWrite */
++        onIOMemoryAccess;
++
+     /** Signal that is emitted on each port access */
+     sigc::signal<void, S2EExecutionState*,
+                  klee::ref<klee::Expr> /* port */,
+diff --git a/qemu/s2e/Plugins/ExecutionTracers/ExecutionTracer.cpp b/qemu/s2e/Plugins/ExecutionTracers/ExecutionTracer.cpp
+index 3b5302d..df330b5 100644
+--- a/qemu/s2e/Plugins/ExecutionTracers/ExecutionTracer.cpp
++++ b/qemu/s2e/Plugins/ExecutionTracers/ExecutionTracer.cpp
+@@ -104,6 +104,8 @@ uint32_t ExecutionTracer::writeData(
+     ExecutionTraceItemHeader item;
+ 
+     assert(m_LogFile);
++    assert (size > 0); // SymDrive
++    assert (type < TRACE_MAX); // SymDrive
+ 
+     item.timeStamp = llvm::sys::TimeValue::now().usec();
+     item.size = size;
+@@ -112,7 +114,7 @@ uint32_t ExecutionTracer::writeData(
+     item.pid = state->getPid();
+ 
+     if (fwrite(&item, sizeof(item), 1, m_LogFile) != 1) {
+-        return 0;
++        assert(false); // SymDrive Was return 0
+     }
+ 
+     if (size) {
+diff --git a/qemu/s2e/Plugins/ExecutionTracers/TraceEntries.h b/qemu/s2e/Plugins/ExecutionTracers/TraceEntries.h
+index 04bcec9..92ce572 100644
+--- a/qemu/s2e/Plugins/ExecutionTracers/TraceEntries.h
++++ b/qemu/s2e/Plugins/ExecutionTracers/TraceEntries.h
+@@ -71,10 +71,81 @@ enum ExecTraceEntryType {
+     TRACE_PAGEFAULT,
+     TRACE_TLBMISS,
+     TRACE_ICOUNT,
++    TRACE_HW_ACCESS, // SymDrive
++    TRACE_INSTR, // SymDrive
++    TRACE_BB, // SymDrive
++    TRACE_EVENT, // SymDrive
++    TRACE_SUCCESS, // SymDrive
++    TRACE_IO_REGION, // SymDrive
+     TRACE_MEM_CHECKER,
+     TRACE_MAX
+ };
+ 
++// SymDrive Added this ---------------->
++enum TRACE_HW_OP {
++    TRACE_HW_PORT = 0,
++    TRACE_HW_IOMEM = 1,
++    TRACE_HW_DMA = 2
++};
++
++enum TRACE_IO_REGION {
++    IO_MAP = 0x1,
++    IO_UNMAP = 0x2,
++    PORT_MAP = 0x3,
++    PORT_UNMAP = 0x4
++};
++
++#define TRACE_HW_OP_NUM_FN 32
++#define TRACE_HW_OP_NID "Not in driver"
++struct ExecutionTraceHWAccess {
++    uint64_t          pc;
++    char              fn_names[TRACE_HW_OP_NUM_FN][32];
++    enum TRACE_HW_OP  op;
++    bool              write; // is it a write?
++    uint64_t          virt_address;
++    uint64_t          phys_address;
++    bool              address_symbolic;
++    uint64_t          value;
++    bool              value_symbolic;
++    uint8_t           size;
++    uint8_t           flags;
++} __attribute__((packed));
++
++struct ExecutionTraceInstr {
++    uint32_t          state_id;
++    uint64_t          pc;
++    uint64_t          delta;
++    char              fn[32];
++} __attribute__((packed));
++
++struct ExecutionTraceBB {
++    uint32_t          state_id;
++    uint64_t          pc;
++    uint64_t          delta;
++    char              fn[32];
++} __attribute__((packed));
++
++struct ExecutionTraceEvent {
++    uint32_t          state_id;
++    uint64_t          pc;
++    uint32_t          event;
++} __attribute__((packed));
++
++struct ExecutionTraceSuccessPath {
++    uint32_t          state_id;
++    uint64_t          pc;
++    uint64_t          success;
++    char              fn[32];
++} __attribute__((packed));
++
++struct ExecutionTraceIORegion {
++    uint32_t             state_id;
++    uint64_t             pc;
++    enum TRACE_IO_REGION flags;
++    uint32_t             address;
++    uint32_t             size;
++} __attribute__((packed));
++// SymDrive <----------------------
+ 
+ struct ExecutionTraceItemHeader{
+     uint64_t timeStamp;
+diff --git a/qemu/s2e/Plugins/ModuleDescriptor.h b/qemu/s2e/Plugins/ModuleDescriptor.h
+index 8defdec..8230290 100644
+--- a/qemu/s2e/Plugins/ModuleDescriptor.h
++++ b/qemu/s2e/Plugins/ModuleDescriptor.h
+@@ -136,6 +136,8 @@ struct ModuleDescriptor
+   //A list of sections
+   ModuleSections Sections;
+ 
++  uint32_t PrimaryModule; // SymDrive
++
+   ModuleDescriptor() {
+     Pid = 0;
+     NativeBase = 0;
+diff --git a/qemu/s2e/Plugins/RawMonitor.cpp b/qemu/s2e/Plugins/RawMonitor.cpp
+index 79b3d5b..f508302 100644
+--- a/qemu/s2e/Plugins/RawMonitor.cpp
++++ b/qemu/s2e/Plugins/RawMonitor.cpp
+@@ -110,6 +110,13 @@ bool RawMonitor::initSection(const std::string &cfgKey, const std::string &svcId
+         return false;
+     }
+ 
++    // SymDrive added this block:
++    cfg.primaryModule = s2e()->getConfig()->getBool(cfgKey + ".primaryModule", false, &ok);
++    if (!ok) {
++        s2e()->getWarningsStream() << "You must specify " << cfgKey << "primaryModule\n";
++        return false;
++    }
++
+     m_cfg.push_back(cfg);
+     return true;
+ }
+@@ -231,6 +238,7 @@ void RawMonitor::opLoadModule(S2EExecutionState *state)
+     }
+ 
+     moduleDescriptor.Pid = moduleConfig.kernelMode ? 0 : state->getPid();
++    moduleDescriptor.PrimaryModule = moduleConfig.primaryModule; // SymDrive
+ 
+     s2e()->getDebugStream() << "RawMonitor loaded " << moduleDescriptor.Name << " " <<
+             hexval(moduleDescriptor.LoadBase) << " " << hexval(moduleDescriptor.Size) << "\n";
+@@ -333,6 +341,7 @@ void RawMonitor::loadModule(S2EExecutionState *state, const Cfg &c, bool skipIfD
+     md.Size = c.size;
+     md.Pid = c.kernelMode ? 0 : state->getPid();
+     md.EntryPoint = c.entrypoint;
++    md.PrimaryModule = c.primaryModule; // SymDrive
+ 
+     s2e()->getDebugStream() << "RawMonitor loaded " << c.name << " " <<
+             hexval(c.start) << ' ' << hexval(c.size) << '\n';
+diff --git a/qemu/s2e/Plugins/RawMonitor.h b/qemu/s2e/Plugins/RawMonitor.h
+index d2a2f9a..b307646 100644
+--- a/qemu/s2e/Plugins/RawMonitor.h
++++ b/qemu/s2e/Plugins/RawMonitor.h
+@@ -62,6 +62,7 @@ public:
+         uint64_t entrypoint;
+         bool delayLoad;
+         bool kernelMode;
++        bool primaryModule; // SymDrive
+     };
+ 
+     struct OpcodeModuleConfig {
+@@ -71,6 +72,7 @@ public:
+         uint64_t entryPoint;
+         uint64_t size;
+         uint32_t kernelMode;
++        uint32_t primaryModule; // SymDrive
+     } __attribute__((packed));
+ 
+     typedef std::vector<Cfg> CfgList;
+diff --git a/qemu/s2e/Plugins/SymbolicHardware.cpp b/qemu/s2e/Plugins/SymbolicHardware.cpp
+index 34a1e4f..5e504de 100644
+--- a/qemu/s2e/Plugins/SymbolicHardware.cpp
++++ b/qemu/s2e/Plugins/SymbolicHardware.cpp
+@@ -42,6 +42,7 @@ extern "C"
+ #include "hw/isa.h"
+ #include "hw/fakepci.h"
+ #include "hw/sysbus.h"
++#include "hw/msi.h"
+ #include "qemu/object.h"
+ }
+ 
+@@ -92,6 +93,12 @@ extern "C" {
+ 
+     static void pci_symbhw_class_init(ObjectClass *klass, void *data);
+     static void isa_symbhw_class_init(ObjectClass *klass, void *data);
++
++    // SymDrive Added these:
++    uint64_t symbhw_read(void *opaque, target_phys_addr_t addr,
++                         unsigned size);
++    void symbhw_write(void *opaque, target_phys_addr_t addr,
++                      uint64_t data, unsigned size);
+ }
+ 
+ 
+@@ -109,9 +116,25 @@ void SymbolicHardware::initialize()
+     if (!ok || keys.empty()) {
+         ws << "No symbolic device descriptor specified in " << getConfigKey() << "." <<
+                 " S2E will start without symbolic hardware." << '\n';
+-        return;
++        // return; // SymDrive
++    }
++    else {
++        // SymDrive added else
++        foreach2(it, keys.begin(), keys.end()) {
++            std::stringstream ss;
++            ss << getConfigKey() << "." << *it;
++            DeviceDescriptor *dd = DeviceDescriptor::create(this, cfg, ss.str());
++            if (!dd) {
++                ws << "Failed to create a symbolic device for " << ss.str() << "\n";
++                exit(-1);
++            }
++
++            dd->print(s2e()->getMessagesStream());
++            m_devices.insert(dd);
++        }
+     }
+ 
++    /*
+     foreach2(it, keys.begin(), keys.end()) {
+         std::stringstream ss;
+         ss << getConfigKey() << "." << *it;
+@@ -124,6 +147,7 @@ void SymbolicHardware::initialize()
+         dd->print(s2e()->getMessagesStream());
+         m_devices.insert(dd);
+     }
++    */
+ 
+     s2e()->getCorePlugin()->onDeviceRegistration.connect(
+         sigc::mem_fun(*this, &SymbolicHardware::onDeviceRegistration)
+@@ -143,6 +167,10 @@ void SymbolicHardware::initialize()
+         s2e()->getCorePlugin()->setPortCallback(symbhw_is_symbolic_none, this);
+         s2e()->getCorePlugin()->setMmioCallback(symbhw_is_mmio_symbolic_none, this);
+     }
++
++    // SymDrive
++    s2e()->getCorePlugin()->onCustomInstruction.connect(
++        sigc::mem_fun(*this, &SymbolicHardware::onCustomInstruction));
+ }
+ 
+ //XXX: Do it per-state!
+@@ -176,7 +204,8 @@ bool SymbolicHardware::setSymbolicMmioRange(S2EExecutionState *state, uint64_t p
+     s2e()->getDebugStream() << "SymbolicHardware: adding MMIO range 0x" << hexval(physaddr)
+             << " length=0x" << size << '\n';
+ 
+-    assert(state->isActive());
++   // SymDrive unsure as to whether we need this.
++   // assert(state->isActive()); // SymDrive this will fail during pci_restore_device???
+ 
+     DECLARE_PLUGINSTATE(SymbolicHardwareState, state);
+     bool b = plgState->setMmioRange(physaddr, size, true);
+@@ -203,6 +232,64 @@ bool SymbolicHardware::isMmioSymbolic(uint64_t physaddress, uint64_t size) const
+     return b;
+ }
+ 
++// SymDrive:  added this
++void SymbolicHardware::onCustomInstruction(S2EExecutionState* state, uint64_t opcode)
++{
++    uint8_t opc = (opcode>>8) & 0xFF;
++    if (opc != 0xB1 && opc != 0xB2) {
++        return;
++    }
++
++    uint32_t phys_address, size, name; // XXX
++    bool ok = true;
++    ok &= state->readCpuRegisterConcrete(CPU_OFFSET(regs[R_EAX]),
++                                         &phys_address, 4);
++    ok &= state->readCpuRegisterConcrete(CPU_OFFSET(regs[R_EBX]),
++                                         &size, 4);
++    ok &= state->readCpuRegisterConcrete(CPU_OFFSET(regs[R_ECX]),
++                                         &name, 4);
++
++    if(!ok) {
++        s2e()->getWarningsStream(state)
++            << "ERROR: symbolic argument was passed to s2e_op "
++            " insert_symbolic opcode\n";
++        return;
++    }
++
++    std::string nameStr;
++    if(!name || !state->readString(name, nameStr)) {
++        s2e()->getWarningsStream(state)
++            << "Error reading string from the guest\n";
++        nameStr = "defstr";
++    }
++    s2e()->getMessagesStream(state)
++        << "Managing symbolic data at " << hexval(phys_address)
++        << " of size " << hexval(size)
++        << " with name '" << nameStr << "'\n";
++
++    switch (opc) {
++        case 0xB1:
++        {
++            // s2e_make_dma_symbolic
++            // SymDrive -- this is a different kind of symbolic memory.
++            setSymbolicMmioRange(state, phys_address, size);
++            break;
++        }
++        case 0xB2:
++        {
++            // s2e_free_dma_symbolic
++            // SymDrive -- this is a different kind of symbolic memory.
++            resetSymbolicMmioRange(state, phys_address, size);
++            break;
++        }
++        default:
++        {
++            s2e()->getMessagesStream(state) << "Matt you idiot, you screwed this up.";
++            break;
++        }
++    }
++}
++
+ static bool symbhw_is_symbolic(uint16_t port, void *opaque)
+ {
+     SymbolicHardware *hw = static_cast<SymbolicHardware*>(opaque);
+@@ -297,7 +384,7 @@ DeviceDescriptor *DeviceDescriptor::create(SymbolicHardware *plg, ConfigFile *cf
+ 
+     std::string id = cfg->getString(key + ".id", "", &ok);
+     if (!ok || id.empty()) {
+-        ws << "You must specifiy an id for " << key << ". " <<
++        ws << "You must specify an id for " << key << ". " <<
+                 "This is required by QEMU for saving/restoring snapshots." << '\n';
+         return NULL;
+     }
+@@ -458,46 +545,92 @@ PciDeviceDescriptor* PciDeviceDescriptor::create(SymbolicHardware *plg, ConfigFi
+ {
+     bool ok;
+     llvm::raw_ostream &ws = plg->s2e()->getWarningsStream();
++    llvm::raw_ostream &ms = plg->s2e()->getMessagesStream();
+ 
+     std::string id = cfg->getString(key + ".id", "", &ok);
+     assert(ok);
+ 
+     uint16_t vid = cfg->getInt(key + ".vid", 0, &ok);
+     if (!ok) {
+-        ws << "You must specifiy a vendor id for a symbolic PCI device!" << '\n';
++        ws << "You must specify a vendor id for a symbolic PCI device!" << '\n';
+         return NULL;
+     }
+ 
+     uint16_t pid = cfg->getInt(key + ".pid", 0, &ok);
+     if (!ok) {
+-        ws << "You must specifiy a product id for a symbolic PCI device!" << '\n';
++        ws << "You must specify a product id for a symbolic PCI device!" << '\n';
+         return NULL;
+     }
+ 
++    uint16_t ss_vid = cfg->getInt(key + ".ss_vid", 0, &ok); // SymDrive added this
++    if (!ok) {
++        ms << "Defaulting to ss_vid of 0\n";
++        ss_vid = 0;
++    }
++
++    uint16_t ss_id = cfg->getInt(key + ".ss_id", 0, &ok); // SymDrive added this
++    if (!ok) {
++        ms << "Defaulting to ss_id of 0\n";
++        ss_id = 0;
++    }
++
+     uint32_t classCode = cfg->getInt(key + ".classCode", 0, &ok);
+     if (!ok || classCode > 0xffffff) {
+-        ws << "You must specifiy a valid class code for a symbolic PCI device!" << '\n';
++        ws << "You must specify a valid class code for a symbolic PCI device!" << '\n';
+         return NULL;
+     }
+ 
+     uint8_t revisionId = cfg->getInt(key + ".revisionId", 0, &ok);
+     if (!ok) {
+-        ws << "You must specifiy a revision id for a symbolic PCI device!" << '\n';
++        ws << "You must specify a revision id for a symbolic PCI device!" << '\n';
+         return NULL;
+     }
+ 
+     uint8_t interruptPin = cfg->getInt(key + ".interruptPin", 0, &ok);
+     if (!ok || interruptPin > 4) {
+-        ws << "You must specifiy an interrupt pin (1-4, 0 for none) for " << key << "!" << '\n';
++        ws << "You must specify an interrupt pin (1-4, 0 for none) for " << key << "!" << '\n';
+         return NULL;
+     }
+ 
++    uint32_t capPM = cfg->getInt(key + ".cap_pm", 0, &ok); // SymDrive
++    if (!ok) {
++        ms << "Defaulting to capPM = 0\n";
++        capPM = 0;
++    } else {
++        if (capPM != 0 && capPM != 1) {
++            ws << "You must specify 0 or 1 for capPM, " << key << "!" << '\n';
++            return NULL;
++        }
++    }
++
++    uint32_t capMSI = cfg->getInt(key + ".cap_msi", 0, &ok); // SymDrive
++    if (!ok) {
++        ms << "Defaulting to capMSI = 0\n";
++        capMSI = 0;
++    } else {
++        if (capMSI > 4096) {
++            ws << "You must specify MSI >= 0 and <= 4096 for capMSI, " << key << "!" << '\n';
++            return NULL;
++        }
++    }
++
++    uint32_t capPCIE = cfg->getInt(key + ".cap_pcie", 0, &ok); // SymDrive
++    if (!ok) {
++        ms << "Defaulting to capPCIE = 0\n";
++        capPCIE = 0;
++    } else {
++        if (capPCIE != 0 && capPCIE != 1) {
++            ws << "You must specify 0 or 1 for capPCIE, " << key << "!" << '\n';
++            return NULL;
++        }
++    }
++
+     std::vector<PciResource> resources;
+ 
+     //Reading the resource list
+     ConfigFile::string_list resKeys = cfg->getListKeys(key + ".resources", &ok);
+     if (!ok || resKeys.empty()) {
+-        ws << "You must specifiy at least one resource descriptor for a symbolic PCI device!" << '\n';
++        ws << "You must specify at least one resource descriptor for a symbolic PCI device!" << '\n';
+         return NULL;
+     }
+ 
+@@ -539,13 +672,43 @@ PciDeviceDescriptor* PciDeviceDescriptor::create(SymbolicHardware *plg, ConfigFi
+     ret->m_classCode = classCode;
+     ret->m_pid = pid;
+     ret->m_vid = vid;
++    ret->m_ss_vid = ss_vid;
++    ret->m_ss_id = ss_id;
+     ret->m_revisionId = revisionId;
+     ret->m_interruptPin = interruptPin;
++    ret->m_capPM = capPM;
++    ret->m_capMSI = capMSI;
++    ret->m_capPCIE = capPCIE;
+     ret->m_resources = resources;
+ 
+     return ret;
+ }
+ 
++static int SymDrive_fakepci_post_load(void *opaque, int version_id) {
++    SymbolicPciDeviceState *hw1 = static_cast<SymbolicPciDeviceState*>(opaque);
++    SymbolicHardware *hw2 = (SymbolicHardware*)g_s2e->getPlugin("SymbolicHardware");
++    assert (hw1);
++    assert (hw2);
++
++    int i = 0;
++    for (i = 0; i < PCI_NUM_REGIONS; i++) {
++        if (hw1->dev.io_regions[i].memory == NULL ||
++            hw1->dev.io_regions[i].address_space == NULL) {
++            continue;
++        }
++
++        int type = hw1->dev.io_regions[i].type;
++
++        if (type & PCI_BASE_ADDRESS_SPACE_IO) {
++            hw2->setSymbolicPortRange(hw1->dev.io_regions[i].addr, hw1->dev.io_regions[i].size, true);
++            // Port I/O
++        } else {
++            // MMIO
++        }
++    }
++
++    return 0;
++}
+ 
+ void PciDeviceDescriptor::initializeQemuDevice()
+ {
+@@ -583,7 +746,12 @@ void PciDeviceDescriptor::initializeQemuDevice()
+     //Replaces VMSTATE_PCI_DEVICE()
+     m_vmStateFields[0].name = m_id.c_str();
+     m_vmStateFields[0].size = sizeof(PCIDevice);
+-    m_vmStateFields[0].vmsd = &vmstate_pci_device;
++    if (m_capPCIE > 0) {
++        m_vmStateFields[0].version_id = 2;
++        m_vmStateFields[0].vmsd = &vmstate_pcie_device;
++    } else {
++        m_vmStateFields[0].vmsd = &vmstate_pci_device;
++    }
+     m_vmStateFields[0].flags = VMS_STRUCT;
+     m_vmStateFields[0].offset = vmstate_offset_value(SymbolicPciDeviceState, dev, PCIDevice);
+ 
+@@ -595,6 +763,7 @@ void PciDeviceDescriptor::initializeQemuDevice()
+     m_vmState->minimum_version_id = 3,
+     m_vmState->minimum_version_id_old = 3,
+     m_vmState->fields = m_vmStateFields;
++    m_vmState->post_load = SymDrive_fakepci_post_load; // SymDrive
+ 
+     type_register_static(m_devInfo);
+ }
+@@ -633,6 +802,9 @@ PciDeviceDescriptor::PciDeviceDescriptor(const std::string &id):DeviceDescriptor
+     m_classCode = 0;
+     m_revisionId = 0;
+     m_interruptPin = 0;
++    m_capPM = 0;
++    m_capMSI = 0;
++    m_capPCIE = 0;
+ }
+ 
+ PciDeviceDescriptor::~PciDeviceDescriptor()
+@@ -645,10 +817,15 @@ void PciDeviceDescriptor::print(llvm::raw_ostream &os) const
+     os << "PCI Device Descriptor id=" << m_id << '\n';
+     os << "VID=" << hexval(m_vid) <<
+             " PID=" << hexval(m_pid) <<
++        " SS_VID=0x" << m_ss_vid << // SymDrive
++        " SS_ID=0x" << m_ss_id << // SymDrive
+             " RevID=" << hexval(m_revisionId) << '\n';
+ 
+     os << "Class=" << hexval(m_classCode) <<
+             " INT=" << hexval(m_interruptPin) << '\n';
++    os << "capPM=" << hexval(m_capPM) << "\n";
++    os << "capMSI=" << hexval(m_capMSI) << "\n";
++    os << "capPCIE=" << hexval(m_capPCIE) << "\n";
+ 
+     unsigned i=0;
+     foreach2(it, m_resources.begin(), m_resources.end()) {
+@@ -683,19 +860,14 @@ void PciDeviceDescriptor::assignIrq(void *irq)
+ 
+ /////////////////////////////////////////////////////////////////////
+ /* Dummy I/O functions for symbolic devices. Unused for now. */
+-
+-/////////////////////////////////////////////////////////////////////
+-/* Dummy I/O functions for symbolic devices. Unused for now. */
+-static uint64_t symbhw_read(void *opaque, target_phys_addr_t addr,
+-                            unsigned size)
+-{
++/* static SymDrive */ uint64_t symbhw_read(void *opaque, target_phys_addr_t addr,
++                            unsigned size) {
+     return 0;
+ }
+ 
+-static void symbhw_write(void *opaque, target_phys_addr_t addr,
+-                         uint64_t data, unsigned size)
+-{
+-
++/* static SymDrive */ void symbhw_write(void *opaque, target_phys_addr_t addr,
++                         uint64_t data, unsigned size) {
++    return;
+ }
+ 
+ static const MemoryRegionOps symbhw_io_ops = {
+@@ -776,7 +948,59 @@ static int pci_symbhw_init(PCIDevice *pci_dev)
+ 
+     pci_conf = symb_pci_state->dev.config;
+     pci_conf[PCI_HEADER_TYPE] = PCI_HEADER_TYPE_NORMAL; // header_type
+-    pci_conf[0x3d] = pci_device_desc->getInterruptPin(); // interrupt pin 0
++    // SymDrive --------->
++    pci_set_byte(&pci_conf[PCI_INTERRUPT_PIN], pci_device_desc->getInterruptPin());
++    pci_set_byte(&pci_conf[PCI_REVISION_ID], pci_device_desc->getRevisionId());
++
++    // Force PCI power management to ON
++    // We could add a flag for this.
++    if (pci_device_desc->getCapPM() > 0) {
++        int r = pci_add_capability(pci_dev, PCI_CAP_ID_PM, 0, PCI_PM_SIZEOF);
++        assert (r >= 0 && "Why isn't power management working?");
++    }
++
++    if (pci_device_desc->getCapMSI() > 0) {
++        // The 0 = find a valid PCI capability offset.
++        // 0x50 seems to work FWIW
++        // The first 64 bytes of PCI config space are
++        // standardized, so 0x50 = the first byte after that.
++        // If we add more capabilities this number might need
++        // to be changed.
++        // false = msi64bit (4th param)
++        // false = msi_per_vector_mask (5th param)
++        msi_init(pci_dev, 0, pci_device_desc->getCapMSI(), false, false);
++    } else {
++        assert (pci_device_desc->getCapMSI() == 0 && "?? MSI should be >= 0");
++    }
++
++    if (pci_device_desc->getCapPCIE() > 0) {
++        // TODO:  I have no idea if we should be using PCI_EXP_TYPE_ENDPOINT
++        // and I also have no idea if 0 is a reasonable "port" number.
++        // We're basically am just calling this function and hoping for the best.
++        int r = pcie_cap_init(pci_dev, 0, PCI_EXP_TYPE_ENDPOINT, 0);
++        assert (r >= 0 && "Why isn't PCI-E working?");
++    }
++
++    if (pci_device_desc->getCapPM() > 0) {
++        uint8_t cap;
++        cap = pci_find_capability(pci_dev, PCI_CAP_ID_PM);
++        g_s2e->getMessagesStream() << "capPM offset: " << hexval(cap) << "\n";
++        assert (cap != 0 && "cap PM bug.");
++    }
++    if (pci_device_desc->getCapMSI() > 0) {
++        uint8_t cap;
++        cap = pci_find_capability(pci_dev, PCI_CAP_ID_MSI);
++        g_s2e->getMessagesStream() << "capMSI offset: " << hexval(cap) << "\n";
++        assert (cap != 0 && "cap MSI bug.");
++    }
++    if (pci_device_desc->getCapPCIE() > 0) {
++        uint8_t cap;
++        cap = pci_find_capability(pci_dev, PCI_CAP_ID_EXP);
++        g_s2e->getMessagesStream() << "capPCIE offset: " << hexval(cap) << "\n";
++        assert (cap != 0 && "cap PCI-E bug.");
++    }
++    // SymDrive <---------
++
+ 
+     const PciDeviceDescriptor::PciResources &resources =
+             pci_device_desc->getResources();
+@@ -794,12 +1018,13 @@ static int pci_symbhw_init(PCIDevice *pci_dev)
+ 
+         if (type & PCI_BASE_ADDRESS_SPACE_IO) {
+             ss << "-io";
+-        } else if (type & PCI_BASE_ADDRESS_SPACE_MEMORY) {
++        } else /* if (type & PCI_BASE_ADDRESS_SPACE_MEMORY) SymDrive */ {
+             ss << "-mmio";
+         }
+ 
+         memory_region_init_io(&symb_pci_state->io[i], &symbhw_io_ops, symb_pci_state, ss.str().c_str(), res.size);
+         pci_register_bar(&symb_pci_state->dev, i, type, &symb_pci_state->io[i]);
++
+         ++i;
+     }
+ 
+@@ -812,6 +1037,18 @@ static int pci_symbhw_uninit(PCIDevice *pci_dev)
+ {
+     SymbolicPciDeviceState *d = DO_UPCAST(SymbolicPciDeviceState, dev, pci_dev);
+ 
++    // PM support requires no special shutdown
++
++    // MSI support
++    if (d->desc->getCapMSI() > 0) {
++        msi_uninit(pci_dev);
++    }
++
++    // PCI-E support
++    if (d->desc->getCapPCIE() > 0) {
++        pcie_cap_exit(pci_dev);
++    }
++
+     for (int i=0; i<d->desc->getResources().size(); ++i) {
+         memory_region_destroy(&d->io[i]);
+     }
+@@ -825,7 +1062,10 @@ static void  pci_symbhw_class_init(ObjectClass *klass, void *data)
+     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
+ 
+     PciDeviceDescriptor *pci_desc = static_cast<PciDeviceDescriptor*>(data);
+-
++    if (pci_desc->getCapPCIE() > 0) {
++        k->is_express = 1;
++    }
++    
+     k->init = pci_symbhw_init;
+     k->exit = pci_symbhw_uninit;
+ 
+@@ -939,10 +1179,12 @@ bool SymbolicHardwareState::PageBitmap::hasSymbolic() const
+ }
+ 
+ void SymbolicHardwareState::PageBitmap::allocateBitmap(klee::BitArray *source) {
+-    if (source) {
+-        bitmap = new klee::BitArray(*source, TARGET_PAGE_SIZE);
+-    } else {
+-        bitmap = new klee::BitArray(TARGET_PAGE_SIZE, false);
++    if (bitmap == NULL) { // SymDrive
++        if (source) {
++            bitmap = new klee::BitArray(*source, TARGET_PAGE_SIZE);
++        } else {
++            bitmap = new klee::BitArray(TARGET_PAGE_SIZE, false);
++        }
+     }
+ }
+ 
+@@ -979,6 +1221,7 @@ SymbolicHardwareState::PageBitmap::~PageBitmap() {
+     if (bitmap) {
+         delete bitmap;
+     }
++    bitmap = NULL; // SymDrive
+ }
+ 
+ //Returns true if the resulting range is fully concrete
+diff --git a/qemu/s2e/Plugins/SymbolicHardware.h b/qemu/s2e/Plugins/SymbolicHardware.h
+index 7c7e5fd..69c7ac6 100644
+--- a/qemu/s2e/Plugins/SymbolicHardware.h
++++ b/qemu/s2e/Plugins/SymbolicHardware.h
+@@ -53,7 +53,7 @@ namespace plugins {
+ 
+ class SymbolicHardware;
+ 
+-class DeviceDescriptor {
++class DeviceDescriptor { //设备描述基类，pci/isa设备描述类为其子类。
+ protected:
+     std::string m_id;
+     void *m_qemuIrq;
+@@ -92,7 +92,7 @@ public:
+     const std::string &getId() const { return m_id; }
+ 
+     virtual void print(llvm::raw_ostream &os) const {}
+-    virtual void initializeQemuDevice() {assert(false);}
++    virtual void initializeQemuDevice() {assert(false);} //接下来4个虚函数必须在子类中实现，否则调用时必报错。
+     virtual void activateQemuDevice(void *bus) { assert(false);}
+     virtual void setInterrupt(bool state) {assert(false);};
+     virtual void assignIrq(void *irq) {assert(false);}
+@@ -160,6 +160,9 @@ private:
+     uint32_t m_classCode;
+     uint8_t m_revisionId;
+     uint8_t m_interruptPin;
++    uint32_t m_capPM;
++    uint32_t m_capMSI;
++    uint32_t m_capPCIE;
+     PciResources m_resources;
+ 
+     PciDeviceDescriptor(const std::string &id);
+@@ -176,6 +179,11 @@ public:
+     uint8_t getRevisionId() const { return m_revisionId; }
+     uint8_t getInterruptPin() const { return m_interruptPin; }
+ 
++    // Capabilities
++    uint32_t getCapPM() const { return m_capPM; }
++    uint32_t getCapMSI() const { return m_capMSI; }
++    uint32_t getCapPCIE() const { return m_capPCIE; }
++
+     const PciResources& getResources() const { return m_resources; }
+     static PciDeviceDescriptor* create(SymbolicHardware *plg, ConfigFile *cfg, const std::string &key);
+ 
+@@ -212,10 +220,11 @@ public:
+     bool isSymbolic(uint16_t port) const;
+ 
+     bool isMmioSymbolic(uint64_t physaddress, uint64_t size) const;
++    void onCustomInstruction(S2EExecutionState* state, uint64_t opcode); // SymDrive
+     bool setSymbolicMmioRange(S2EExecutionState *state, uint64_t physaddr, uint64_t size);
+     bool resetSymbolicMmioRange(S2EExecutionState *state, uint64_t physaddr, uint64_t size);
+ private:
+-    uint32_t m_portMap[65536/(sizeof(uint32_t)*8)];
++    uint32_t m_portMap[65536/(sizeof(uint32_t)*8)]; //每一个bit为一个port
+     DeviceDescriptors m_devices;
+ 
+     void onDeviceRegistration();
+diff --git a/qemu/s2e/S2E.cpp b/qemu/s2e/S2E.cpp
+index de7915d..384ef36 100644
+--- a/qemu/s2e/S2E.cpp
++++ b/qemu/s2e/S2E.cpp
+@@ -607,7 +607,9 @@ llvm::raw_ostream& S2E::getStream(llvm::raw_ostream &stream,
+             stream  << "[Node " << m_currentProcessIndex <<
+                     "/" << m_currentProcessId << " - State " << state->getID() << "] ";
+         }else {
+-            stream << "[State " << state->getID() << "] ";
++            stream << "[" << state->getID() << "/" // MJR
++                   << m_s2eExecutor->getStatesCount() << "] ";
++            // stream << "[State " << state->getID() << "] ";  // MJR
+         }
+     }
+     return stream;
+diff --git a/qemu/s2e/S2E.h b/qemu/s2e/S2E.h
+index d7f9339..616ea73 100644
+--- a/qemu/s2e/S2E.h
++++ b/qemu/s2e/S2E.h
+@@ -207,6 +207,7 @@ public:
+     /***********************/
+     /* Runtime information */
+     S2EExecutor* getExecutor() { return m_s2eExecutor; }
++    const S2EExecutor* getExecutor() const { return m_s2eExecutor; }
+ 
+     //XXX: A plugin can hold cached state information. When a state is deleted,
+     //remove all the cached info from all plugins.
+diff --git a/qemu/s2e/S2EExecutionState.cpp b/qemu/s2e/S2EExecutionState.cpp
+index d7991ea..ac6477a 100644
+--- a/qemu/s2e/S2EExecutionState.cpp
++++ b/qemu/s2e/S2EExecutionState.cpp
+@@ -1166,6 +1166,7 @@ ref<Expr> S2EExecutionState::createSymbolicValue(
+ {
+ 
+     std::vector<unsigned char> concreteValues;
++    // concreteValues.resize(Expr::getMinBytesForWidth(width)); // MJR added this line
+     return createConcolicValue(name, width, concreteValues);
+ }
+ 
+@@ -1835,3 +1836,4 @@ int s2e_is_runnable(S2EExecutionState *state)
+ }
+ 
+ } // extern "C"
++
+diff --git a/qemu/s2e/S2EExecutor.cpp b/qemu/s2e/S2EExecutor.cpp
+index 12df7a0..9a873b1 100644
+--- a/qemu/s2e/S2EExecutor.cpp
++++ b/qemu/s2e/S2EExecutor.cpp
+@@ -159,7 +159,7 @@ namespace {
+     cl::opt<unsigned>
+     MaxForksOnConcretize("max-forks-on-concretize",
+             cl::desc("Maximum number of states to fork when concretizing symbolic value"),
+-            cl::init(256));
++                         cl::init(3)); // MJR
+ 
+     cl::opt<bool>
+     FlushTBsOnStateSwitch("flush-tbs-on-state-switch",
+@@ -390,29 +390,103 @@ void S2EHandler::processTestCase(const klee::ExecutionState &state,
+     //Use onTestCaseGeneration event instead.
+ }
+ 
++void S2EExecutor::handlerMJRCommon(Executor* executor,
++                                   ExecutionState* state,
++                                   klee::KInstruction* target,
++                                   int accessType,
++                                   std::vector<klee::ref<klee::Expr> > &args) {
++    assert(dynamic_cast<S2EExecutor*>(executor));
++    S2EExecutor* s2eExecutor = static_cast<S2EExecutor*>(executor);
++
++    // MJR This call corresponds to tcg_llvm_trace_memory_access
++    // tcg_llvm_trace_memory_access parameters are:
++    // vaddr, value, sizeof(value), isWrite
++    // MJR Added for I/O memory tracing:
++    if(!s2eExecutor->m_s2e->getCorePlugin()->onIOMemoryAccess.empty()) {
++        assert(dynamic_cast<S2EExecutionState*>(state));
++        assert(args.size() == 4);
++
++        S2EExecutionState* s2eState = static_cast<S2EExecutionState*>(state);
++
++        // Argument index 0 is the address
++        klee::ref<klee::Expr> vaddr = args[0];
++
++        // Argument index 2 is size in bits:
++        Expr::Width sizeInBits = cast<klee::ConstantExpr>(args[2])->getZExtValue();
++        Expr::Width sizeInBytes = sizeInBits / 8;
++
++        // Argument index 1 is value:
++        klee::ref<Expr> value = klee::ExtractExpr::create(args[1], 0, sizeInBits);
++
++        // Argument index 3 is whether it's a write operation or not
++        bool isWrite = cast<klee::ConstantExpr>(args[3])->getZExtValue();
++
++        s2eExecutor->m_s2e->getCorePlugin()->onIOMemoryAccess.emit(
++            s2eState,
++            accessType,
++            vaddr,            // address
++            value,            // value
++            sizeInBytes,      // size converted to bytes
++            isWrite);         // true = write, false = read
++    }
++}
++
+ void S2EExecutor::handlerTraceMemoryAccess(Executor* executor,
++                                           ExecutionState* state,
++                                           klee::KInstruction* target,
++                                           std::vector<klee::ref<klee::Expr> > &args)
++{
++    handlerMJRCommon(executor, state, target, 1, args);
++}
++
++void S2EExecutor::handlerTracePortAccess(Executor* executor,
+                                      ExecutionState* state,
+                                      klee::KInstruction* target,
+                                      std::vector<klee::ref<klee::Expr> > &args)
+ {
+-    assert(dynamic_cast<S2EExecutor*>(executor));
++    // assert(dynamic_cast<S2EExecutor*>(executor));
++    // S2EExecutor* s2eExecutor = static_cast<S2EExecutor*>(executor);
+ 
+-    S2EExecutor* s2eExecutor = static_cast<S2EExecutor*>(executor);
+-    if(!s2eExecutor->m_s2e->getCorePlugin()->onDataMemoryAccess.empty()) {
+-        assert(dynamic_cast<S2EExecutionState*>(state));
+-        S2EExecutionState* s2eState = static_cast<S2EExecutionState*>(state);
++    // if(!s2eExecutor->m_s2e->getCorePlugin()->onIOMemoryAccess.empty()) {
++    //     assert(dynamic_cast<S2EExecutionState*>(state));
++    //     assert(args.size() == 4);
+ 
+-        assert(args.size() == 6);
++    //     S2EExecutionState* s2eState = static_cast<S2EExecutionState*>(state);
++    //     int accessType = 0; // Port I/O
+ 
+-        Expr::Width width = cast<klee::ConstantExpr>(args[3])->getZExtValue();
+-        bool isWrite = cast<klee::ConstantExpr>(args[4])->getZExtValue();
+-        bool isIO    = cast<klee::ConstantExpr>(args[5])->getZExtValue();
++    //     // The indexes into the args array correspond with the parameters
++    //     // passed to the tcg_llvm_trace_port_access function
++    //     // Argument index 0 is the port number
++    //     ref<Expr> port = args[0];
+ 
+-        ref<Expr> value = klee::ExtractExpr::create(args[2], 0, width);
++    //     // Argument index 2 is the size in bytes:
++    //     int sizeInBytes = cast<klee::ConstantExpr>(args[2])->getZExtValue();
++    //     Expr::Width sizeInBits = sizeInBytes * 8;
+ 
+-        s2eExecutor->m_s2e->getCorePlugin()->onDataMemoryAccess.emit(
+-                s2eState, args[0], args[1], value, isWrite, isIO);
+-    }
++    //     // Argument index 1 is the value:
++    //     ref<Expr> value = klee::ExtractExpr::create(args[1], 0, sizeInBits);
++
++    //     // Argument index 3 is whether it's a write operation or not
++    //     bool isWrite = cast<klee::ConstantExpr>(args[3])->getZExtValue();
++
++    //     s2eExecutor->m_s2e->getCorePlugin()->onIOMemoryAccess.emit(
++    //         s2eState,
++    //         accessType,
++    //         port,
++    //         value,
++    //         sizeInBytes,
++    //         isWrite);
++    // }
++
++    handlerMJRCommon(executor, state, target, 0, args);
++}
++
++void S2EExecutor::handlerTraceDMAAccess(Executor* executor,
++                                        ExecutionState* state,
++                                        klee::KInstruction* target,
++                                        std::vector<klee::ref<klee::Expr> > &args)
++{
++    handlerMJRCommon(executor, state, target, 2, args);
+ }
+ 
+ void S2EExecutor::handlerTraceInstruction(klee::Executor* executor,
+@@ -458,31 +532,6 @@ void S2EExecutor::handlerOnTlbMiss(Executor* executor,
+     s2e_on_tlb_miss(g_s2e, s2eState, constAddress, isWrite);
+ }
+ 
+-void S2EExecutor::handlerTracePortAccess(Executor* executor,
+-                                     ExecutionState* state,
+-                                     klee::KInstruction* target,
+-                                     std::vector<klee::ref<klee::Expr> > &args)
+-{
+-    assert(dynamic_cast<S2EExecutor*>(executor));
+-
+-    S2EExecutor* s2eExecutor = static_cast<S2EExecutor*>(executor);
+-
+-    if(!s2eExecutor->m_s2e->getCorePlugin()->onPortAccess.empty()) {
+-        assert(dynamic_cast<S2EExecutionState*>(state));
+-        S2EExecutionState* s2eState = static_cast<S2EExecutionState*>(state);
+-
+-        assert(args.size() == 4);
+-
+-        Expr::Width width = cast<klee::ConstantExpr>(args[2])->getZExtValue();
+-        bool isWrite = cast<klee::ConstantExpr>(args[3])->getZExtValue();
+-
+-        ref<Expr> value = klee::ExtractExpr::create(args[1], 0, width);
+-
+-        s2eExecutor->m_s2e->getCorePlugin()->onPortAccess.emit(
+-                s2eState, args[0], value, isWrite);
+-    }
+-}
+-
+ void S2EExecutor::handleForkAndConcretize(Executor* executor,
+                                      ExecutionState* state,
+                                      klee::KInstruction* target,
+@@ -757,6 +806,8 @@ S2EExecutor::S2EExecutor(S2E* s2e, TCGLLVMContext *tcgLLVMContext,
+ 
+     __DEFINE_EXT_FUNCTION(s2e_ismemfunc)
+     __DEFINE_EXT_FUNCTION(s2e_notdirty_mem_write)
++        __DEFINE_EXT_FUNCTION(s2e_issymfunc) // MJR
++        __DEFINE_EXT_FUNCTION(s2e_establishIOMap) // MJR
+ 
+     __DEFINE_EXT_FUNCTION(cpu_io_recompile)
+     __DEFINE_EXT_FUNCTION(can_do_io)
+@@ -857,9 +908,10 @@ S2EExecutor::S2EExecutor(S2E* s2e, TCGLLVMContext *tcgLLVMContext,
+     if (!execute_llvm) {
+         Function* function;
+ 
+-        function = kmodule->module->getFunction("tcg_llvm_trace_memory_access");
+-        assert(function);
+-        addSpecialFunctionHandler(function, handlerTraceMemoryAccess);
++        // MJR
++        //function = kmodule->module->getFunction("tcg_llvm_trace_memory_access");
++        //assert(function);
++        //addSpecialFunctionHandler(function, handlerTraceMemoryAccess);
+ 
+         function = kmodule->module->getFunction("tcg_llvm_trace_port_access");
+         assert(function);
+@@ -1140,9 +1192,9 @@ void S2EExecutor::switchToConcrete(S2EExecutionState *state)
+     if (m_forceConcretizations) {
+         //XXX: Find a adhoc dirty way to implement overconstrained consistency model
+         //There should be a consistency plugin somewhere else
+-        s2e::plugins::ModuleExecutionDetector *md =
+-                dynamic_cast<s2e::plugins::ModuleExecutionDetector*>(m_s2e->getPlugin("ModuleExecutionDetector"));
+-        if (md && !md->getCurrentDescriptor(state)) {
++        //s2e::plugins::ModuleExecutionDetector *md = // MJR commented out
++        //        dynamic_cast<s2e::plugins::ModuleExecutionDetector*>(m_s2e->getPlugin("ModuleExecutionDetector"));
++        //if (md && !md->getCurrentDescriptor(state)) { // MJR We don't need this here
+ 
+             if(!wos->isAllConcrete()) {
+                 /* The object contains symbolic values. We have to
+@@ -1157,7 +1209,7 @@ void S2EExecutor::switchToConcrete(S2EExecutionState *state)
+                     }
+                 }
+             }
+-        }
++            // } // MJR
+     }
+ 
+     //assert(os->isAllConcrete());
+@@ -2182,7 +2234,7 @@ S2EExecutor::StatePair S2EExecutor::fork(ExecutionState &current,
+                             ref<Expr> condition, bool isInternal)
+ {
+     assert(dynamic_cast<S2EExecutionState*>(&current));
+-    assert(!static_cast<S2EExecutionState*>(&current)->m_runningConcrete);
++    // assert(!static_cast<S2EExecutionState*>(&current)->m_runningConcrete); // MJR moved below
+ 
+     StatePair res;
+ 
+@@ -2196,6 +2248,7 @@ S2EExecutor::StatePair S2EExecutor::fork(ExecutionState &current,
+ 
+         assert(dynamic_cast<S2EExecutionState*>(res.first));
+         assert(dynamic_cast<S2EExecutionState*>(res.second));
++        assert(!static_cast<S2EExecutionState*>(&current)->m_runningConcrete); // MJR moved from above
+ 
+         std::vector<S2EExecutionState*> newStates(2);
+         std::vector<ref<Expr> > newConditions(2);
+@@ -2332,7 +2385,6 @@ void S2EExecutor::yieldState(ExecutionState &s)
+ 
+     // Skip the opcode
+     state.writeCpuState(CPU_OFFSET(eip), state.getPc() + 10, 32);
+-
+     // Stop current execution
+     state.writeCpuState(CPU_OFFSET(exception_index), EXCP_S2E, 8*sizeof(int));
+     throw CpuExitException();
+@@ -2498,6 +2550,14 @@ void S2EExecutor::updateStats(S2EExecutionState *state)
+     processTimers(state, 0);
+ }
+ 
++std::set<ExecutionState *> &S2EExecutor::MJRGetAllStates(void) { // MJR
++    return states;
++}
++
++const std::set<ExecutionState *> &S2EExecutor::MJRGetAllStates(void) const { // MJR
++    return states;
++}
++
+ } // namespace s2e
+ 
+ /******************************/
+diff --git a/qemu/s2e/S2EExecutor.h b/qemu/s2e/S2EExecutor.h
+index f82958e..b827240 100644
+--- a/qemu/s2e/S2EExecutor.h
++++ b/qemu/s2e/S2EExecutor.h
+@@ -154,7 +154,6 @@ public:
+                                 = std::vector<klee::ref<klee::Expr> >());
+ 
+     /* Functions to be called mainly from QEMU */
+-
+     S2EExecutionState* selectNextState(S2EExecutionState* state);
+     klee::ExecutionState* selectNonSpeculativeState(S2EExecutionState *state);
+ 
+@@ -205,6 +204,8 @@ public:
+     void initializeStatistics();
+ 
+     void updateStats(S2EExecutionState *state);
++    std::set<klee::ExecutionState *> &MJRGetAllStates (void); // MJR
++    const std::set<klee::ExecutionState *> &MJRGetAllStates (void) const; // MJR
+ 
+     bool isLoadBalancing() const {
+         return m_inLoadBalancing;
+@@ -220,10 +221,25 @@ public:
+     }
+ 
+ protected:
++public: // MJR
++    static void handlerMJRCommon(klee::Executor* executor,
++                                 klee::ExecutionState* state,
++                                 klee::KInstruction* target,
++                                 int accessType,
++                                 std::vector<klee::ref<klee::Expr> > &args);
+     static void handlerTraceMemoryAccess(klee::Executor* executor,
+-                                    klee::ExecutionState* state,
+-                                    klee::KInstruction* target,
+-                                    std::vector<klee::ref<klee::Expr> > &args);
++                                         klee::ExecutionState* state,
++                                         klee::KInstruction* target,
++                                         std::vector<klee::ref<klee::Expr> > &args);
++    static void handlerTracePortAccess(klee::Executor* executor,
++                                       klee::ExecutionState* state,
++                                       klee::KInstruction* target,
++                                       std::vector<klee::ref<klee::Expr> > &args);
++    static void handlerTraceDMAAccess(klee::Executor* executor,
++                                      klee::ExecutionState* state,
++                                      klee::KInstruction* target,
++                                      std::vector<klee::ref<klee::Expr> > &args);
++  protected: // MJR moved
+ 
+     //Traces every single LLVM instruction in dyngend code
+     static void handlerTraceInstruction(klee::Executor* executor,
+@@ -231,11 +247,6 @@ protected:
+                                     klee::KInstruction* target,
+                                     std::vector<klee::ref<klee::Expr> > &args);
+ 
+-    static void handlerTracePortAccess(klee::Executor* executor,
+-                                         klee::ExecutionState* state,
+-                                         klee::KInstruction* target,
+-                                         std::vector<klee::ref<klee::Expr> > &args);
+-
+     static void handlerOnTlbMiss(klee::Executor* executor,
+                                          klee::ExecutionState* state,
+                                          klee::KInstruction* target,
+diff --git a/qemu/s2e/s2e_qemu.h b/qemu/s2e/s2e_qemu.h
+index 29f324d..adfe3db 100644
+--- a/qemu/s2e/s2e_qemu.h
++++ b/qemu/s2e/s2e_qemu.h
+@@ -147,8 +147,9 @@ void s2e_on_exception(unsigned intNb);
+ 
+ /** Called on memory accesses from generated code */
+ void s2e_trace_memory_access(
+-        uint64_t vaddr, uint64_t haddr, uint8_t* buf, unsigned size,
+-        int isWrite, int isIO);
++        struct S2E *s2e, struct S2EExecutionState* state, // MJR
++        uint64_t vaddr, /* uint64_t haddr, MJR */ uint8_t* buf, unsigned size,
++        int isWrite /*, int isIO MJR */);
+ 
+ /** Called on port access from helper code */
+ void s2e_trace_port_access(
+@@ -328,6 +329,8 @@ void s2e_on_initialization_complete(void);
+ 
+ void s2e_on_monitor_event(struct QDict *ret);
+ 
++void s2e_establishIOMap(int prefix, uint32_t port, uint32_t pc, uint32_t unique_id); // MJR added
++
+ //XXX: Provide a means of including KLEE header
+ /* Return a possible constant value for the input expression. This
+    allows programs to forcibly concretize values on their own. */
+@@ -349,9 +352,9 @@ int s2e_is_forking();
+ uint64_t tcg_llvm_fork_and_concretize(uint64_t value,
+                                       uint64_t knownMin,
+                                       uint64_t knownMax);
+-void tcg_llvm_trace_memory_access(uint64_t vaddr, uint64_t haddr,
+-                                  uint64_t value, uint32_t bits,
+-                                  uint8_t isWrite, uint8_t isIo);
++void tcg_llvm_trace_memory_access(uint64_t vaddr, /* uint64_t haddr, MJR */
++                                  uint64_t value, uint32_t /* bits MJR */ sizeInBytes,
++                                  uint8_t isWrite /*, uint8_t isIo MJR */);
+ void tcg_llvm_trace_port_access(uint64_t port, uint64_t value,
+                                 unsigned bits, int isWrite);
+ //#endif
+diff --git a/qemu/softmmu_defs.h b/qemu/softmmu_defs.h
+index 5772f03..9c1bd57 100644
+--- a/qemu/softmmu_defs.h
++++ b/qemu/softmmu_defs.h
+@@ -146,9 +146,10 @@ int s2e_ismemfunc(struct MemoryRegion *mr, int isWrite);
+ 
+ uintptr_t s2e_notdirty_mem_write(target_phys_addr_t ram_addr);
+ int s2e_ismemfunc(struct MemoryRegion *mr, int isWrite);
+-
++int s2e_issymfunc(struct MemoryRegion *opaque, target_ulong addr); // MJR
+ 
+ #endif
+ 
++extern int g_tracing_enabled; // MJR                                                                                   
+ 
+ #endif
+diff --git a/qemu/softmmu_header.h b/qemu/softmmu_header.h
+index afa0193..67f7e43 100644
+--- a/qemu/softmmu_header.h
++++ b/qemu/softmmu_header.h
+@@ -196,7 +196,7 @@ glue(glue(glue(CPU_PREFIX, ld), USUFFIX), MEMSUFFIX)(ENV_PARAM
+ 
+         //XXX: Fix this to be on the dataflow
+         //res = S2E_TRACE_MEMORY(addr, physaddr, res, 0, 0);
+-        S2E_TRACE_MEMORY(addr, physaddr, res, 0, 0);
++        // S2E_TRACE_MEMORY(addr, physaddr, res, 0, 0); // MJR
+     }
+     return res;
+ }
+@@ -232,7 +232,7 @@ glue(glue(glue(CPU_PREFIX, lds), SUFFIX), MEMSUFFIX)(ENV_PARAM
+ #endif
+             res = glue(glue(lds, SUFFIX), _raw)((uint8_t *)physaddr);
+ 
+-        S2E_TRACE_MEMORY(addr, physaddr, res, 0, 0);
++        // S2E_TRACE_MEMORY(addr, physaddr, res, 0, 0); // MJR
+     }
+     return res;
+ }
+@@ -272,7 +272,7 @@ glue(glue(glue(CPU_PREFIX, st), SUFFIX), MEMSUFFIX)(ENV_PARAM target_ulong ptr,
+ #endif
+             glue(glue(st, SUFFIX), _raw)((uint8_t *)physaddr, v);
+ 
+-        S2E_TRACE_MEMORY(addr, physaddr, v, 1, 0);
++        // S2E_TRACE_MEMORY(addr, physaddr, v, 1, 0); // MJR
+     }
+ }
+ 
+diff --git a/qemu/softmmu_template.h b/qemu/softmmu_template.h
+index 1ebbdf5..1dedfca 100644
+--- a/qemu/softmmu_template.h
++++ b/qemu/softmmu_template.h
+@@ -85,15 +85,21 @@
+ #include <s2e/s2e_config.h>
+ 
+ #ifdef S2E_LLVM_LIB
+-#define S2E_TRACE_MEMORY(vaddr, haddr, value, isWrite, isIO) \
+-    tcg_llvm_trace_memory_access(vaddr, haddr, \
+-                                 value, 8*sizeof(value), isWrite, isIO);
++// MJR Changed definition of S2E_TRACE_MEMORY
++//#define S2E_TRACE_MEMORY(vaddr, haddr, value, isWrite, isIO)  \
++//    tcg_llvm_trace_memory_access(vaddr, haddr,                        \
++//                                 value, 8*sizeof(value), isWrite, isIO);
++#define S2E_TRACE_MEMORY(vaddr, value, isWrite) \
++    tcg_llvm_trace_memory_access(vaddr, value, sizeof(value), isWrite);
+ #define S2E_FORK_AND_CONCRETIZE(val, max) \
+     tcg_llvm_fork_and_concretize(val, 0, max)
+ #else // S2E_LLVM_LIB
+-#define S2E_TRACE_MEMORY(vaddr, haddr, value, isWrite, isIO) \
+-    s2e_trace_memory_access(vaddr, haddr, \
+-                            (uint8_t*) &value, sizeof(value), isWrite, isIO);
++// MJR Changed definition of S2E_TRACE_MEMORY
++//#define S2E_TRACE_MEMORY(vaddr, haddr, value, isWrite, isIO)  \
++//    s2e_trace_memory_access(vaddr, haddr,                             \
++//                            (uint8_t*) &value, sizeof(value), isWrite, isIO);
++#define S2E_TRACE_MEMORY(vaddr, value, isWrite) \
++    s2e_trace_memory_access(g_s2e, g_s2e_state, vaddr, (uint8_t*) &value, sizeof(value), isWrite);
+ #define S2E_FORK_AND_CONCRETIZE(val, max) (val)
+ #endif // S2E_LLVM_LIB
+ 
+@@ -137,9 +143,27 @@ DATA_TYPE glue(glue(io_read, SUFFIX), MMUSUFFIX)(ENV_PARAM
+     physaddr = (physaddr & TARGET_PAGE_MASK) + addr;
+ 
+ #ifdef CONFIG_S2E
++/*
++  MJR
+     if (glue(s2e_is_mmio_symbolic_, SUFFIX)(physaddr)) {
+         s2e_switch_to_symbolic(g_s2e, g_s2e_state);
+     }
++*/
++    // Only switch to symbolic if we're actually looking at
++    // doing a symbolic I/O memory operation
++    // OR DMA.  The second condition is for DMA, the first is for I/O memory.
++    if (s2e_issymfunc(mr, addr) || glue(s2e_is_mmio_symbolic_, SUFFIX)(physaddr)) {
++        // On this branch, we're accessing symbolic memory
++        // MJR
++        //target_phys_addr_t MJR_physaddr;
++        // This command gives us the address of the base of the page
++        //MJR_physaddr = cpu_cpu_x86_handle_mmu_fget_phys_page_debug(env, addr);
++        // Add the offset.
++        //MJR_physaddr += addr & (~TARGET_PAGE_MASK);
++        //if (glue(s2e_is_mmio_symbolic_, SUFFIX)(MJR_physaddr)) { // MJR
++        //If at least one byte is symbolic, generate a label
++        s2e_switch_to_symbolic(g_s2e, g_s2e_state);
++    }
+ #endif
+ 
+     env->mem_io_pc = (uintptr_t)retaddr;
+@@ -165,6 +189,7 @@ DATA_TYPE glue(glue(io_read, SUFFIX), MMUSUFFIX)(ENV_PARAM
+     return res;
+ }
+ 
++// MJR: this function executes natively:
+ inline DATA_TYPE glue(glue(io_read_chk, SUFFIX), MMUSUFFIX)(ENV_PARAM target_phys_addr_t physaddr,
+                                           target_ulong addr,
+                                           void *retaddr)
+@@ -175,99 +200,135 @@ inline DATA_TYPE glue(glue(io_read_chk, SUFFIX), MMUSUFFIX)(ENV_PARAM target_phy
+ 
+ #elif defined(S2E_LLVM_LIB) //S2E_LLVM_LIB
+ 
+-inline DATA_TYPE glue(io_make_symbolic, SUFFIX)(const char *name) {
+-    uint8_t ret;
+-    klee_make_symbolic(&ret, sizeof(ret), name);
+-    return ret;
+-}
+-
+-
+-inline DATA_TYPE glue(io_read_chk_symb_, SUFFIX)(const char *label, target_ulong physaddr, uintptr_t pa)
+-{
+-    union {
+-        DATA_TYPE dt;
+-        uint8_t arr[1<<SHIFT];
+-    }data;
+-    unsigned i;
+-
+-    data.dt = glue(glue(ld, USUFFIX), _raw)((uint8_t *)(intptr_t)(pa));
+-
+-    for (i = 0; i<(1<<SHIFT); ++i) {
+-        if (s2e_is_mmio_symbolic_b(physaddr + i)) {
+-            data.arr[i] = glue(io_make_symbolic, SUFFIX)(label);
+-        }
+-    }
+-    return data.dt;
+-}
+-
+-inline DATA_TYPE glue(glue(io_read_chk, SUFFIX), MMUSUFFIX)(ENV_PARAM target_phys_addr_t physaddr,
+-                                          target_ulong addr,
+-                                          void *retaddr)
+-{
+-    DATA_TYPE res;
+-    target_phys_addr_t origaddr = physaddr;
+-    MemoryRegion *mr = iotlb_to_region(physaddr);
+ 
+-    target_ulong naddr = (physaddr & TARGET_PAGE_MASK)+addr;
+-    char label[64];
+-    int isSymb = 0;
+-    if ((isSymb = glue(s2e_is_mmio_symbolic_, SUFFIX)(naddr))) {
+-        //If at least one byte is symbolic, generate a label
+-        trace_port(label, "iommuread_", naddr, env->eip);
+-    }
+-
+-    //If it is not DMA, then check if it is normal memory
+-    env->mem_io_pc = (uintptr_t)retaddr;
+-    if (mr != &io_mem_ram && mr != &io_mem_rom
+-        && mr != &io_mem_unassigned
+-        && mr != &io_mem_notdirty
+-            && !can_do_io(env)) {
+-        cpu_io_recompile(env, retaddr);
+-    }
+-
+-    env->mem_io_vaddr = addr;
+-#if SHIFT <= 2
+-    if (s2e_ismemfunc(mr, 0)) {
+-        uintptr_t pa = s2e_notdirty_mem_write(physaddr);
+-        if (isSymb) {
+-            return glue(io_read_chk_symb_, SUFFIX)(ENV_VAR label, naddr, (uintptr_t)(pa));
+-        }
+-        res = glue(glue(ld, USUFFIX), _raw)((uint8_t *)(intptr_t)(pa));
+-        return res;
+-    }
+-#else
+-#ifdef TARGET_WORDS_BIGENDIAN
+-    if (s2e_ismemfunc(mr, 0)) {
+-        uintptr_t pa = s2e_notdirty_mem_write(physaddr);
+-
+-        if (isSymb) {
+-            res = glue(io_read_chk_symb_, SUFFIX)(label, naddr, (uintptr_t)(pa)) << 32;
+-            res |= glue(io_read_chk_symb_, SUFFIX)(label, naddr,(uintptr_t)(pa+4));
+-        }else {
+-            res = glue(glue(ld, USUFFIX), _raw)((uint8_t *)(intptr_t)(pa)) << 32;
+-            res |= glue(glue(ld, USUFFIX), _raw)((uint8_t *)(intptr_t)(pa+4));
+-        }
+-
+-        return res;
+-    }
+-#else
+-    if (s2e_ismemfunc(mr, 0)) {
+-        uintptr_t pa = s2e_notdirty_mem_write(physaddr);
+-        if (isSymb) {
+-            res = glue(io_read_chk_symb_, SUFFIX)(label, naddr, (uintptr_t)(pa));
+-            res |= glue(io_read_chk_symb_, SUFFIX)(label, naddr, (uintptr_t)(pa+4)) << 32;
+-        }else {
+-            res = glue(glue(ld, USUFFIX), _raw)((uint8_t *)(intptr_t)(pa));
+-            res |= glue(glue(ld, USUFFIX), _raw)((uint8_t *)(intptr_t)(pa + 4)) << 32;
+-        }
+-        return res;
+-    }
+-#endif
+-#endif /* SHIFT > 2 */
+ 
+-    //By default, call the original io_read function, which is external
+-    return glue(glue(io_read, SUFFIX), MMUSUFFIX)(ENV_VAR origaddr, addr, retaddr);
+-}
++/* // MJR: this function executes symbolically */
++/* inline DATA_TYPE glue(io_make_symbolic, SUFFIX)(const char *name) { */
++/*     uint8_t ret; */
++/*     klee_make_symbolic(&ret, sizeof(ret), name); */
++/*     return ret; */
++/* } */
++
++
++/* // MJR: this function executes symbolically */
++/* // MJR assumes physaddr is actually the physical address */
++/* inline DATA_TYPE glue(io_read_chk_symb_, SUFFIX)(const char *label, target_ulong addr, // MJR added addr */
++/*                                                  target_ulong physaddr, uintptr_t pa) */
++/* { */
++/*     union { */
++/*         DATA_TYPE dt; */
++/*         uint8_t arr[1<<SHIFT]; */
++/*     }data; */
++/*     unsigned i; */
++
++/*     data.dt = glue(glue(ld, USUFFIX), _raw)((uint8_t *)(intptr_t)(pa)); */
++
++/*     // MJR assume all this memory is symbolic */
++/*     for (i = 0; i<(1<<SHIFT); ++i) { */
++/*         // if (s2e_is_mmio_symbolic_b(physaddr + i)) { // MJR */
++/*         data.arr[i] = glue(io_make_symbolic, SUFFIX)(label); */
++/*         // } */
++/*     } */
++
++/*     // MJR added this but it does not work in S2E1.2: */
++/*     { */
++/*         unsigned int isWrite = 0; */
++/*         S2E_TRACE_MEMORY(addr, data.dt, isWrite); */
++/*     } */
++
++/*     return data.dt; */
++/* } */
++
++/* // MJR: this function executes symbolically */
++/* inline DATA_TYPE glue(glue(io_read_chk, SUFFIX), MMUSUFFIX)(ENV_PARAM target_phys_addr_t physaddr, */
++/*                                           target_ulong addr, */
++/*                                           void *retaddr) */
++/* { */
++/*     DATA_TYPE res; */
++/*     target_phys_addr_t origaddr = physaddr; */
++/*     MemoryRegion *mr = iotlb_to_region(physaddr); */
++
++/*     target_ulong naddr = (physaddr & TARGET_PAGE_MASK)+addr; */
++/*     char label[64]; */
++/*     int isSymb = 0; */
++
++/*     // MJR added this block: */
++/*     if (s2e_issymfunc(mr, addr)) */
++/*     { */
++/*         // This command gives us the address of the base of the page */
++/*         //MJR_physaddr = cpu_get_phys_page_debug(env, addr); */
++/*         // Add the offset. */
++/*         //MJR_physaddr += addr & (~TARGET_PAGE_MASK); */
++/*         isSymb = 1; */
++/*         //isSymb = glue(s2e_is_mmio_symbolic_, SUFFIX)(MJR_physaddr); */
++/*         //if (isSymb) { // MJR */
++/*         //If at least one byte is symbolic, generate a label */
++/*         // trace_port(label, "iommuread_", MJR_physaddr, env->eip); */
++/*         // trace_port(label, "iommuread_", physaddr, env->eip); // S2E 1.1 */
++/*         trace_port(label, "iommuread_", naddr, env->eip); // S2E 1.2 */
++/*     } */
++
++/* /\* */
++/*   MJR */
++/*     if ((isSymb = glue(s2e_is_mmio_symbolic_, SUFFIX)(naddr))) { */
++/*         //If at least one byte is symbolic, generate a label */
++/*         trace_port(label, "iommuread_", naddr, env->eip); */
++/*     } */
++/* *\/ */
++
++/*     //If it is not DMA, then check if it is normal memory */
++/*     env->mem_io_pc = (uintptr_t)retaddr; */
++/*     if (mr != &io_mem_ram && mr != &io_mem_rom */
++/*         && mr != &io_mem_unassigned */
++/*         && mr != &io_mem_notdirty */
++/*             && !can_do_io(env)) { */
++/*         cpu_io_recompile(env, retaddr); */
++/*     } */
++
++/*     env->mem_io_vaddr = addr; */
++/* #if SHIFT <= 2 */
++/* //    if (s2e_ismemfunc(mr, 0)) { // MJR */
++/*     uintptr_t pa = s2e_notdirty_mem_write(physaddr); // MJR */
++/*     if (isSymb) { // MJR */
++/*         return glue(io_read_chk_symb_, SUFFIX)(ENV_VAR label, addr, naddr, (uintptr_t)(pa)); */
++/*     } */
++/*     res = glue(glue(ld, USUFFIX), _raw)((uint8_t *)(intptr_t)(pa)); */
++/*     return res; */
++/* #else */
++/* #ifdef TARGET_WORDS_BIGENDIAN */
++/* //    if (s2e_ismemfunc(mr, 0)) { // MJR */
++/*     if (isSymb) { // MJR */
++/*         uintptr_t pa = s2e_notdirty_mem_write(physaddr); */
++
++/*         if (isSymb) { */
++/*             res = glue(io_read_chk_symb_, SUFFIX)(label, addr, naddr, (uintptr_t)(pa)) << 32; */
++/*             res |= glue(io_read_chk_symb_, SUFFIX)(label, addr, naddr,(uintptr_t)(pa+4)); */
++/*         }else { */
++/*             res = glue(glue(ld, USUFFIX), _raw)((uint8_t *)(intptr_t)(pa)) << 32; */
++/*             res |= glue(glue(ld, USUFFIX), _raw)((uint8_t *)(intptr_t)(pa+4)); */
++/*         } */
++
++/*         return res; */
++/*     } */
++/* #else */
++/* //    if (s2e_ismemfunc(mr, 0)) { // MJR */
++/*     if (isSymb) { // MJR */
++/*         uintptr_t pa = s2e_notdirty_mem_write(physaddr); */
++/*         if (isSymb) { */
++/*             res = glue(io_read_chk_symb_, SUFFIX)(label, addr, naddr, (uintptr_t)(pa)); */
++/*             res |= glue(io_read_chk_symb_, SUFFIX)(label, addr, naddr, (uintptr_t)(pa+4)) << 32; */
++/*         }else { */
++/*             res = glue(glue(ld, USUFFIX), _raw)((uint8_t *)(intptr_t)(pa)); */
++/*             res |= glue(glue(ld, USUFFIX), _raw)((uint8_t *)(intptr_t)(pa + 4)) << 32; */
++/*         } */
++/*         return res; */
++/*     } */
++/* #endif */
++/* #endif /\* SHIFT > 2 *\/ */
++
++/*     //By default, call the original io_read function, which is external */
++/*     return glue(glue(io_read, SUFFIX), MMUSUFFIX)(ENV_VAR origaddr, addr, retaddr); */
++/* } */
+ 
+ 
+ #endif
+@@ -303,7 +364,7 @@ glue(glue(glue(HELPER_PREFIX, ld), SUFFIX), MMUSUFFIX)(ENV_PARAM
+             ioaddr = env->iotlb[mmu_idx][index];
+             res = glue(glue(io_read_chk, SUFFIX), MMUSUFFIX)(ENV_VAR ioaddr, addr, retaddr);
+ 
+-            S2E_TRACE_MEMORY(addr, addr+ioaddr, res, 0, 1);
++            // S2E_TRACE_MEMORY(addr, addr+ioaddr, res, 0, 1); // MJR
+ 
+         } else if (unlikely(((addr & ~S2E_RAM_OBJECT_MASK) + DATA_SIZE - 1) >= S2E_RAM_OBJECT_SIZE)) {
+             /* slow unaligned access (it spans two pages or IO) */
+@@ -336,7 +397,7 @@ glue(glue(glue(HELPER_PREFIX, ld), SUFFIX), MMUSUFFIX)(ENV_PARAM
+ #endif
+                 res = glue(glue(ld, USUFFIX), _raw)((uint8_t *)(intptr_t)(addr+addend));
+ 
+-            S2E_TRACE_MEMORY(addr, addr+addend, res, 0, 0);
++            // S2E_TRACE_MEMORY(addr, addr+addend, res, 0, 0); // MJR
+         }
+     } else {
+         /* the page is not in the TLB : fill it */
+@@ -381,7 +442,7 @@ glue(glue(slow_ld, SUFFIX), MMUSUFFIX)(ENV_PARAM
+             ioaddr = env->iotlb[mmu_idx][index];
+             res = glue(glue(io_read_chk, SUFFIX), MMUSUFFIX)(ENV_VAR ioaddr, addr, retaddr);
+ 
+-            S2E_TRACE_MEMORY(addr, addr+ioaddr, res, 0, 1);
++            // S2E_TRACE_MEMORY(addr, addr+ioaddr, res, 0, 1); // MJR
+         } else if (((addr & ~S2E_RAM_OBJECT_MASK) + DATA_SIZE - 1) >= S2E_RAM_OBJECT_SIZE) {
+ 
+         do_unaligned_access:
+@@ -411,7 +472,7 @@ glue(glue(slow_ld, SUFFIX), MMUSUFFIX)(ENV_PARAM
+ #endif
+                 res = glue(glue(ld, USUFFIX), _raw)((uint8_t *)(intptr_t)(addr+addend));
+ 
+-            S2E_TRACE_MEMORY(addr, addr+addend, res, 0, 0);
++            // S2E_TRACE_MEMORY(addr, addr+addend, res, 0, 0); // MJR
+         }
+     } else {
+         /* the page is not in the TLB : fill it */
+@@ -439,7 +500,7 @@ void glue(glue(io_write, SUFFIX), MMUSUFFIX)(
+                                           void *retaddr);
+ #ifndef S2E_LLVM_LIB
+ 
+-
++// MJR This function executes natively:
+ void glue(glue(io_write, SUFFIX), MMUSUFFIX)(ENV_PARAM
+                                              target_phys_addr_t physaddr,
+                                           DATA_TYPE val,
+@@ -448,6 +509,26 @@ void glue(glue(io_write, SUFFIX), MMUSUFFIX)(ENV_PARAM
+ {
+     MemoryRegion *mr = iotlb_to_region(physaddr);
+ 
++#ifdef CONFIG_S2E
++    // Only switch to symbolic if we're actually looking at
++    // doing a symbolic I/O memory operation.  Second condition is for DMA.
++    // This code should not run in symbolic mode
++    if (s2e_issymfunc(mr, addr) || glue(s2e_is_mmio_symbolic_, SUFFIX)(physaddr)) {
++        // On this branch, we're accessing symbolic memory
++        // MJR
++        //target_phys_addr_t MJR_physaddr;
++        // This command gives us the address of the base of the page
++        //MJR_physaddr = cpu_cpu_x86_handle_mmu_fget_phys_page_debug(env, addr);
++        // Add the offset.
++        //MJR_physaddr += addr & (~TARGET_PAGE_MASK);
++        //if (glue(s2e_is_mmio_symbolic_, SUFFIX)(MJR_physaddr)) { // MJR
++        //If at least one byte is symbolic, generate a label
++        if (g_tracing_enabled) {
++            s2e_switch_to_symbolic(g_s2e, g_s2e_state);
++        }
++    }
++#endif
++
+     physaddr = (physaddr & TARGET_PAGE_MASK) + addr;
+     if (mr != &io_mem_ram && mr != &io_mem_rom
+         && mr != &io_mem_unassigned
+@@ -483,6 +564,7 @@ inline void glue(glue(io_write_chk, SUFFIX), MMUSUFFIX)(ENV_PARAM target_phys_ad
+ #else
+ 
+ 
++// MJR: this function executes symbolically
+ /**
+   * Only if compiling for LLVM.
+   * This function checks whether a write goes to a clean memory page.
+@@ -491,64 +573,77 @@ inline void glue(glue(io_write_chk, SUFFIX), MMUSUFFIX)(ENV_PARAM target_phys_ad
+   *
+   * It also deals with writes to memory-mapped devices that are symbolic
+   */
+-inline void glue(glue(io_write_chk, SUFFIX), MMUSUFFIX)(ENV_PARAM target_phys_addr_t physaddr,
+-                                          DATA_TYPE val,
+-                                          target_ulong addr,
+-                                          void *retaddr)
+-{
+-    target_phys_addr_t origaddr = physaddr;
+-    MemoryRegion *mr = iotlb_to_region(physaddr);
+ 
+-    physaddr = (physaddr & TARGET_PAGE_MASK) + addr;
+-    if (mr != &io_mem_ram && mr != &io_mem_rom
+-        && mr != &io_mem_unassigned
+-        && mr != &io_mem_notdirty
+-            && !can_do_io(env)) {
+-        cpu_io_recompile(env, retaddr);
+-    }
+-
+-
+-    env->mem_io_vaddr = addr;
+-    env->mem_io_pc = (uintptr_t)retaddr;
+-#if SHIFT <= 2
+-    if (s2e_ismemfunc(mr, 1)) {
+-        uintptr_t pa = s2e_notdirty_mem_write(physaddr);
+-        glue(glue(st, SUFFIX), _raw)((uint8_t *)(intptr_t)(pa), val);
+-        return;
+-    }
+-#else
+-#ifdef TARGET_WORDS_BIGENDIAN
+-    if (s2e_ismemfunc(s2e_ismemfunc(mr, 1)) {
+-        uintptr_t pa = s2e_notdirty_mem_write(physaddr);
+-        stl_raw((uint8_t *)(intptr_t)(pa), val>>32);
+-        stl_raw((uint8_t *)(intptr_t)(pa+4), val);
+-        return;
+-    }
+-#else
+-    if (s2e_ismemfunc(mr, 1)) {
+-        uintptr_t pa = s2e_notdirty_mem_write(physaddr);
+-        stl_raw((uint8_t *)(intptr_t)(pa), val);
+-        stl_raw((uint8_t *)(intptr_t)(pa+4), val>>32);
+-        return;
+-    }
+-#endif
+-#endif /* SHIFT > 2 */
+-
+-    //XXX: Check if MMIO is symbolic, and add corresponding trace entry
+-
+-    //Since we do not handle symbolic devices for now, we offer the
+-    //option of concretizing the arguments to I/O helpers.
+-    if (g_s2e_concretize_io_writes) {
+-        val = klee_get_value(val);
+-    }
+-
+-    if (g_s2e_concretize_io_addresses) {
+-        addr = klee_get_value(addr);
+-    }
+-
+-    //By default, call the original io_write function, which is external
+-    glue(glue(io_write, SUFFIX), MMUSUFFIX)(ENV_VAR origaddr, val, addr, retaddr);
+-}
++/* inline void glue(glue(io_write_chk, SUFFIX), MMUSUFFIX)(ENV_PARAM target_phys_addr_t physaddr, */
++/*                                           DATA_TYPE val, */
++/*                                           target_ulong addr, */
++/*                                           void *retaddr) */
++/* { */
++/*     target_phys_addr_t origaddr = physaddr; */
++/*     MemoryRegion *mr = iotlb_to_region(physaddr); */
++/*     int isSymb = 0; // MJR */
++
++/*     physaddr = (physaddr & TARGET_PAGE_MASK) + addr; */
++/*     if (mr != &io_mem_ram && mr != &io_mem_rom */
++/*         && mr != &io_mem_unassigned */
++/*         && mr != &io_mem_notdirty */
++/*             && !can_do_io(env)) { */
++/*         cpu_io_recompile(env, retaddr); */
++/*     } */
++
++
++/*     env->mem_io_vaddr = addr; */
++/*     env->mem_io_pc = (uintptr_t)retaddr; */
++
++/*     // MJR - added this block: */
++/*     if (s2e_issymfunc(mr, addr)) { */
++/*         unsigned int isWrite = 1; */
++/*         S2E_TRACE_MEMORY(addr, val, isWrite); */
++/*         isSymb = 1; */
++/*     } */
++
++/* #if SHIFT <= 2 */
++/*     // if (s2e_ismemfunc(mr, 1)) { // MJR */
++/*     if (isSymb) { // MJR */
++/*         uintptr_t pa = s2e_notdirty_mem_write(physaddr); */
++/*         glue(glue(st, SUFFIX), _raw)((uint8_t *)(intptr_t)(pa), val); */
++/*         return; */
++/*     } */
++/* #else */
++/* #ifdef TARGET_WORDS_BIGENDIAN */
++/*     // if (s2e_ismemfunc(s2e_ismemfunc(mr, 1)) { // MJR */
++/*     if (isSymb) { // MJR */
++/*         uintptr_t pa = s2e_notdirty_mem_write(physaddr); */
++/*         stl_raw((uint8_t *)(intptr_t)(pa), val>>32); */
++/*         stl_raw((uint8_t *)(intptr_t)(pa+4), val); */
++/*         return; */
++/*     } */
++/* #else */
++/*     // if (s2e_ismemfunc(mr, 1)) { // MJR */
++/*     if (isSymb) { // MJR */
++/*         uintptr_t pa = s2e_notdirty_mem_write(physaddr); */
++/*         stl_raw((uint8_t *)(intptr_t)(pa), val); */
++/*         stl_raw((uint8_t *)(intptr_t)(pa+4), val>>32); */
++/*         return; */
++/*     } */
++/* #endif */
++/* #endif /\* SHIFT > 2 *\/ */
++
++/*     //XXX: Check if MMIO is symbolic, and add corresponding trace entry */
++
++/*     //Since we do not handle symbolic devices for now, we offer the */
++/*     //option of concretizing the arguments to I/O helpers. */
++/*     if (g_s2e_concretize_io_writes) { */
++/*         val = klee_get_value(val); */
++/*     } */
++
++/*     if (g_s2e_concretize_io_addresses) { */
++/*         addr = klee_get_value(addr); */
++/*     } */
++
++/*     //By default, call the original io_write function, which is external */
++/*     glue(glue(io_write, SUFFIX), MMUSUFFIX)(ENV_VAR origaddr, val, addr, retaddr); */
++/* } */
+ 
+ #endif
+ 
+@@ -580,7 +675,7 @@ void glue(glue(glue(HELPER_PREFIX, st), SUFFIX), MMUSUFFIX)(ENV_PARAM
+             ioaddr = env->iotlb[mmu_idx][index];
+             glue(glue(io_write_chk, SUFFIX), MMUSUFFIX)(ENV_VAR ioaddr, val, addr, retaddr);
+ 
+-            S2E_TRACE_MEMORY(addr, addr+ioaddr, val, 1, 1);
++            // S2E_TRACE_MEMORY(addr, addr+ioaddr, val, 1, 1); // MJR
+         } else if (unlikely(((addr & ~S2E_RAM_OBJECT_MASK) + DATA_SIZE - 1) >= S2E_RAM_OBJECT_SIZE)) {
+ 
+         do_unaligned_access:
+@@ -604,6 +699,8 @@ void glue(glue(glue(HELPER_PREFIX, st), SUFFIX), MMUSUFFIX)(ENV_PARAM
+ #endif
+             addend = env->tlb_table[mmu_idx][index].addend;
+ #if defined(CONFIG_S2E) && defined(S2E_ENABLE_S2E_TLB) && !defined(S2E_LLVM_LIB)
++            // MJR DMA write recording would take place here or in this immediate vicinity if we wanted it.
++            // DMA writes are not the same as I/O memory writes.
+             S2ETLBEntry *e = &env->s2e_tlb_table[mmu_idx][object_index & (CPU_S2E_TLB_SIZE-1)];
+             if(likely((e->addend & 1) && _s2e_check_concrete(e->objectState, addr & ~S2E_RAM_OBJECT_MASK, DATA_SIZE)))
+                 glue(glue(st, SUFFIX), _p)((uint8_t*)(addr + (e->addend&~1)), val);
+@@ -611,7 +708,7 @@ void glue(glue(glue(HELPER_PREFIX, st), SUFFIX), MMUSUFFIX)(ENV_PARAM
+ #endif
+                 glue(glue(st, SUFFIX), _raw)((uint8_t *)(intptr_t)(addr+addend), val);
+ 
+-            S2E_TRACE_MEMORY(addr, addr+addend, val, 1, 0);
++            // S2E_TRACE_MEMORY(addr, addr+addend, val, 1, 0); // MJR
+         }
+     } else {
+         /* the page is not in the TLB : fill it */
+@@ -653,7 +750,7 @@ static void glue(glue(slow_st, SUFFIX), MMUSUFFIX)(ENV_PARAM
+             ioaddr = env->iotlb[mmu_idx][index];
+             glue(glue(io_write_chk, SUFFIX), MMUSUFFIX)(ENV_VAR ioaddr, val, addr, retaddr);
+ 
+-            S2E_TRACE_MEMORY(addr, addr+ioaddr, val, 1, 1);
++            // S2E_TRACE_MEMORY(addr, addr+ioaddr, val, 1, 1); // MJR
+         } else if (((addr & ~S2E_RAM_OBJECT_MASK) + DATA_SIZE - 1) >= S2E_RAM_OBJECT_SIZE) {
+ 
+         do_unaligned_access:
+@@ -683,7 +780,7 @@ static void glue(glue(slow_st, SUFFIX), MMUSUFFIX)(ENV_PARAM
+ #endif
+                 glue(glue(st, SUFFIX), _raw)((uint8_t *)(intptr_t)(addr+addend), val);
+ 
+-            S2E_TRACE_MEMORY(addr, addr+addend, val, 1, 0);
++            // S2E_TRACE_MEMORY(addr, addr+addend, val, 1, 0); // MJR
+         }
+     } else {
+         /* the page is not in the TLB : fill it */
+diff --git a/qemu/target-i386/op_helper.c b/qemu/target-i386/op_helper.c
+index 21502eb..4c31112 100644
+--- a/qemu/target-i386/op_helper.c
++++ b/qemu/target-i386/op_helper.c
+@@ -39,6 +39,10 @@
+ #include "cpu-defs.h"
+ #include "helper.h"
+ 
++#ifdef S2E_LLVM_LIB
++#include "s2e/s2e_qemu.h" // MJR
++#endif
++
+ #if !defined(CONFIG_USER_ONLY)
+ #include "softmmu_exec.h"
+ #endif /* !defined(CONFIG_USER_ONLY) */
+@@ -747,19 +751,27 @@ void helper_check_iol(uint32_t t0)
+     check_io(t0, 4);
+ }
+ 
+-#ifdef S2E_LLVM_LIB
++#ifdef S2E_LLVM_LIB // MJR This code executes symbolically
+ /**
+  *  We bypass the call to the handlers in case of writes to symbolic ports to
+  *  avoid concretizing data unnecessarily.
+  */
+ 
++static uint32_t unique_id = 0; // MJR
++
+ void helper_outb(uint32_t port, uint32_t data)
+ {
++    if (s2e_is_port_symbolic(g_s2e, g_s2e_state, port)) { // MJR added conditional
++        int size_in_bytes = 1; // MJR
++        int is_write = 1; // MJR
++        tcg_llvm_trace_port_access(port, data, size_in_bytes, is_write); // MJR
++    }
++
+     if (g_s2e_concretize_io_addresses) {
+         port = klee_get_value(port);
+     }
+ 
+-    tcg_llvm_trace_port_access(port, data, 8, 1);
++    // tcg_llvm_trace_port_access(port, data, 8, 1); // MJR
+     if (!s2e_is_port_symbolic(g_s2e, g_s2e_state, port)) {
+         if (g_s2e_concretize_io_writes) {
+             data = klee_get_value(data & 0xFF);
+@@ -776,25 +788,35 @@ target_ulong helper_inb(uint32_t port)
+     }
+ 
+     if (s2e_is_port_symbolic(g_s2e, g_s2e_state, port)) {
++        unique_id++; // MJR
++
+         char label[64];
+-        trace_port(label, "inb", port, env->eip);
+-        uint8_t res = klee_int8(label);
+-        tcg_llvm_trace_port_access(port, res, 8, 0);
++        trace_port(label, "inb", port, env->eip, unique_id);
++        uint8_t res = klee_int8(label); // MJR
++        int size_in_bytes = 1; // MJR
++        int is_write = 0; // MJR
++        s2e_establishIOMap (1, port, env->eip, unique_id); // MJR
++        tcg_llvm_trace_port_access(port, res, size_in_bytes, is_write); // MJR
+         return res;
+     }
+-
+     target_ulong res = cpu_inb(port);
+-    tcg_llvm_trace_port_access(port, res, 8, 0);
++    // tcg_llvm_trace_port_access(port, res, 8, 0); // MJR removed
+     return res;
+ }
+ 
+ void helper_outw(uint32_t port, uint32_t data)
+ {
++    if (s2e_is_port_symbolic(g_s2e, g_s2e_state, port)) { // MJR added conditional
++        int size_in_bytes = 2; // MJR
++        int is_write = 1; // MJR
++        tcg_llvm_trace_port_access(port, data, size_in_bytes, is_write); // MJR
++    }
++
+     if (g_s2e_concretize_io_addresses) {
+         port = klee_get_value(port);
+     }
+ 
+-    tcg_llvm_trace_port_access(port, data, 16, 1);
++    // tcg_llvm_trace_port_access(port, data, 16, 1); // MJR
+     if (!s2e_is_port_symbolic(g_s2e, g_s2e_state, port)) {
+         if (g_s2e_concretize_io_writes) {
+             data = klee_get_value(data & 0xFFFF);
+@@ -811,24 +833,35 @@ target_ulong helper_inw(uint32_t port)
+     }
+ 
+     if (s2e_is_port_symbolic(g_s2e, g_s2e_state, port)) {
++        unique_id++; // MJR
++
+         char label[64];
+-        trace_port(label, "inw", port, env->eip);
++        trace_port(label, "inw", port, env->eip, unique_id);
+         uint16_t res = klee_int16(label);
+-        tcg_llvm_trace_port_access(port, res, 16, 0);
++        int size_in_bytes = 2; // MJR
++        int is_write = 0; // MJR
++        s2e_establishIOMap (2, port, env->eip, unique_id); // MJR
++        tcg_llvm_trace_port_access(port, res, size_in_bytes, is_write); // MJR
+         return res;
+     }
+     target_ulong res = cpu_inw(port);
+-    tcg_llvm_trace_port_access(port, res, 16, 0);
++    // tcg_llvm_trace_port_access(port, res, 16, 0); // MJR removed
+     return res;
+ }
+ 
+ void helper_outl(uint32_t port, uint32_t data)
+ {
++    if (s2e_is_port_symbolic(g_s2e, g_s2e_state, port)) { // MJR added conditional
++        int size_in_bytes = 4; // MJR
++        int is_write = 1; // MJR
++        tcg_llvm_trace_port_access(port, data, size_in_bytes, is_write); // MJR
++    }
++
+     if (g_s2e_concretize_io_addresses) {
+         port = klee_get_value(port);
+     }
+ 
+-    tcg_llvm_trace_port_access(port, data, 32, 1);
++    // tcg_llvm_trace_port_access(port, data, 32, 1); // MJR removed
+     if (!s2e_is_port_symbolic(g_s2e, g_s2e_state, port)) {
+         if (g_s2e_concretize_io_writes) {
+             data = klee_get_value(data);
+@@ -845,25 +878,34 @@ target_ulong helper_inl(uint32_t port)
+     }
+ 
+     if (s2e_is_port_symbolic(g_s2e, g_s2e_state, port)) {
++        unique_id++; // MJR
++
+         char label[64];
+-        trace_port(label, "inl", port, env->eip);
++        trace_port(label, "inl", port, env->eip, unique_id);
+         uint32_t res = klee_int32(label);
+-        tcg_llvm_trace_port_access(port, res, 32, 0);
++        int size_in_bytes = 4; // MJR
++        int is_write = 0; // MJR
++        s2e_establishIOMap (3, port, env->eip, unique_id); // MJR
++        tcg_llvm_trace_port_access(port, res, size_in_bytes, is_write); // MJR
+         return res;
+     }
+     target_ulong res = cpu_inl(port);
+-    tcg_llvm_trace_port_access(port, res, 32, 0);
++    // tcg_llvm_trace_port_access(port, res, 32, 0); // MJR removed
+     return res;
+ }
+-#else
++#else // MJR this code executes natively
+ 
+ void helper_outb(uint32_t port, uint32_t data)
+ {
+ #ifdef CONFIG_S2E
+     if (s2e_is_port_symbolic(g_s2e, g_s2e_state, port)) {
+-        s2e_switch_to_symbolic(g_s2e, g_s2e_state);
++        int size_in_bytes = 1; // MJR
++        int is_write = 1;
++        s2e_trace_port_access(g_s2e, g_s2e_state, port, data & 0xff, size_in_bytes, is_write); // MJR Added 0xff
++        // s2e_switch_to_symbolic(g_s2e, g_s2e_state); // MJR
++        return; // MJR
+     }
+-    s2e_trace_port_access(g_s2e, g_s2e_state, port, data, 8, 1);
++    // s2e_trace_port_access(g_s2e, g_s2e_state, port, data, 8, 1); // MJR removed
+ #endif
+     cpu_outb(port, data & 0xff);
+ }
+@@ -872,13 +914,16 @@ target_ulong helper_inb(uint32_t port)
+ {
+ #ifdef CONFIG_S2E
+     if (s2e_is_port_symbolic(g_s2e, g_s2e_state, port)) {
++        // int size_in_bytes = 1; // MJR
++        // int is_write = 0; // MJR
++        // s2e_trace_port_access(g_s2e, g_s2e_state, port, 0, size_in_bytes, is_write); // MJR Removed
+         s2e_switch_to_symbolic(g_s2e, g_s2e_state);
+     }
+ #endif
+     target_ulong res = cpu_inb(port);
+-#ifdef CONFIG_S2E
+-    s2e_trace_port_access(g_s2e, g_s2e_state, port, res, 8, 0);
+-#endif
++//#ifdef CONFIG_S2E
++//    s2e_trace_port_access(g_s2e, g_s2e_state, port, res, 8, 0); // MJR removed
++//#endif
+     return res;
+ }
+ 
+@@ -886,9 +931,13 @@ void helper_outw(uint32_t port, uint32_t data)
+ {
+ #ifdef CONFIG_S2E
+     if (s2e_is_port_symbolic(g_s2e, g_s2e_state, port)) {
+-        s2e_switch_to_symbolic(g_s2e, g_s2e_state);
++        int size_in_bytes = 2; // MJR
++        int is_write = 1; // MJR
++        s2e_trace_port_access(g_s2e, g_s2e_state, port, data & 0xffff, size_in_bytes, is_write); // MJR Added 0xffff
++        //s2e_switch_to_symbolic(g_s2e, g_s2e_state); // MJR
++        return; // MJR
+     }
+-    s2e_trace_port_access(g_s2e, g_s2e_state, port, data, 16, 1);
++    // s2e_trace_port_access(g_s2e, g_s2e_state, port, data, 16, 1); // MJR removed
+ #endif
+     cpu_outw(port, data & 0xffff);
+ }
+@@ -897,13 +946,16 @@ target_ulong helper_inw(uint32_t port)
+ {
+ #ifdef CONFIG_S2E
+     if (s2e_is_port_symbolic(g_s2e, g_s2e_state, port)) {
++        // int size_in_bytes = 2; // MJR
++        // int is_write = 0;
++        // s2e_trace_port_access(g_s2e, g_s2e_state, port, 0, size_in_bytes, is_write);  // MJR Removed
+         s2e_switch_to_symbolic(g_s2e, g_s2e_state);
+     }
+ #endif
+     target_ulong res = cpu_inw(port);
+-#ifdef CONFIG_S2E
+-    s2e_trace_port_access(g_s2e, g_s2e_state, port, res, 16, 0);
+-#endif
++//#ifdef CONFIG_S2E
++//    s2e_trace_port_access(g_s2e, g_s2e_state, port, res, 16, 0); // MJR removed
++//#endif
+     return res;
+ }
+ 
+@@ -911,9 +963,13 @@ void helper_outl(uint32_t port, uint32_t data)
+ {
+ #ifdef CONFIG_S2E
+     if (s2e_is_port_symbolic(g_s2e, g_s2e_state, port)) {
+-        s2e_switch_to_symbolic(g_s2e, g_s2e_state);
++        int size_in_bytes = 4; // MJR
++        int is_write = 1; // MJR
++        s2e_trace_port_access(g_s2e, g_s2e_state, port, data, size_in_bytes, is_write); // MJR
++        //s2e_switch_t o_symbolic(g_s2e, g_s2e_state); // MJR
++        return; // MJR
+     }
+-    s2e_trace_port_access(g_s2e, g_s2e_state, port, data, 32, 1);
++    // s2e_trace_port_access(g_s2e, g_s2e_state, port, data, 32, 1); // MJR removed
+ #endif
+     cpu_outl(port, data);
+ }
+@@ -922,13 +978,16 @@ target_ulong helper_inl(uint32_t port)
+ {
+ #ifdef CONFIG_S2E
+     if (s2e_is_port_symbolic(g_s2e, g_s2e_state, port)) {
++        // int size_in_bytes = 4; // MJR
++        // int is_write = 0;
++        // s2e_trace_port_access(g_s2e, g_s2e_state, port, 0, size_in_bytes, is_write);  // MJR Removed
+         s2e_switch_to_symbolic(g_s2e, g_s2e_state);
+     }
+ #endif
+     target_ulong res = cpu_inl(port);
+-#ifdef CONFIG_S2E
+-    s2e_trace_port_access(g_s2e, g_s2e_state, port, res, 32, 0);
+-#endif
++//#ifdef CONFIG_S2E
++//    s2e_trace_port_access(g_s2e, g_s2e_state, port, res, 32, 0); // MJR removed
++//#endif
+     return res;
+ }
+ 
+@@ -2335,7 +2394,7 @@ void helper_cmpxchg8b(target_ulong a0)
+         eflags |= CC_Z;
+     } else {
+         /* always do the store */
+-        stq(a0, d); 
++        stq(a0, d);
+         EDX_W((uint32_t)(d >> 32));
+         EAX_W((uint32_t)d);
+         eflags &= ~CC_Z;
+@@ -2360,8 +2419,8 @@ void helper_cmpxchg16b(target_ulong a0)
+         eflags |= CC_Z;
+     } else {
+         /* always do the store */
+-        stq(a0, d0); 
+-        stq(a0 + 8, d1); 
++        stq(a0, d0);
++        stq(a0 + 8, d1);
+         EDX = d1;
+         EAX = d0;
+         eflags &= ~CC_Z;
+@@ -2760,7 +2819,7 @@ void helper_lcall_real(int new_cs, target_ulong new_eip1,
+ }
+ 
+ /* protected mode call */
+-void helper_lcall_protected(int new_cs, target_ulong new_eip, 
++void helper_lcall_protected(int new_cs, target_ulong new_eip,
+                             int shift, int next_eip_addend)
+ {
+     int new_stack, i;
+@@ -3477,7 +3536,7 @@ void helper_rdpmc(void)
+         raise_exception(EXCP0D_GPF);
+     }
+     helper_svm_check_intercept_param(SVM_EXIT_RDPMC, 0);
+-    
++
+     /* currently unimplemented */
+     raise_exception_err(EXCP06_ILLOP, 0);
+ }
+@@ -4944,7 +5003,7 @@ void helper_fxsave(target_ulong ptr, int data64)
+     if (data64) {
+         stq(ptr + 0x08, 0); /* rip */
+         stq(ptr + 0x10, 0); /* rdp */
+-    } else 
++    } else
+ #endif
+     {
+         stl(ptr + 0x08, 0); /* eip */
+@@ -5206,7 +5265,7 @@ void helper_hlt(int next_eip_addend)
+ {
+     helper_svm_check_intercept_param(SVM_EXIT_HLT, 0);
+     EIP += next_eip_addend;
+-    
++
+     do_hlt();
+ }
+ 
+@@ -5409,16 +5468,16 @@ void tlb_fill(CPUX86State *env1, target_ulong addr, target_ulong page_addr,
+ #if defined(CONFIG_USER_ONLY)
+ 
+ void helper_vmrun(int aflag, int next_eip_addend)
+-{ 
++{
+ }
+-void helper_vmmcall(void) 
+-{ 
++void helper_vmmcall(void)
++{
+ }
+ void helper_vmload(int aflag)
+-{ 
++{
+ }
+ void helper_vmsave(int aflag)
+-{ 
++{
+ }
+ void helper_stgi(void)
+ {
+@@ -5426,14 +5485,14 @@ void helper_stgi(void)
+ void helper_clgi(void)
+ {
+ }
+-void helper_skinit(void) 
+-{ 
++void helper_skinit(void)
++{
+ }
+ void helper_invlpga(int aflag)
+-{ 
++{
+ }
+-void helper_vmexit(uint32_t exit_code, uint64_t exit_info_1) 
+-{ 
++void helper_vmexit(uint32_t exit_code, uint64_t exit_info_1)
++{
+ }
+ void helper_svm_check_intercept_param(uint32_t type, uint64_t param)
+ {
+@@ -5443,7 +5502,7 @@ void svm_check_intercept(CPUX86State *env1, uint32_t type)
+ {
+ }
+ 
+-void helper_svm_check_io(uint32_t port, uint32_t param, 
++void helper_svm_check_io(uint32_t port, uint32_t param,
+                          uint32_t next_eip_addend)
+ {
+ }
+@@ -5452,16 +5511,16 @@ void helper_svm_check_io(uint32_t port, uint32_t param,
+ static inline void svm_save_seg(target_phys_addr_t addr,
+                                 const SegmentCache *sc)
+ {
+-    stw_phys(addr + offsetof(struct vmcb_seg, selector), 
++    stw_phys(addr + offsetof(struct vmcb_seg, selector),
+              sc->selector);
+-    stq_phys(addr + offsetof(struct vmcb_seg, base), 
++    stq_phys(addr + offsetof(struct vmcb_seg, base),
+              sc->base);
+-    stl_phys(addr + offsetof(struct vmcb_seg, limit), 
++    stl_phys(addr + offsetof(struct vmcb_seg, limit),
+              sc->limit);
+-    stw_phys(addr + offsetof(struct vmcb_seg, attrib), 
++    stw_phys(addr + offsetof(struct vmcb_seg, attrib),
+              ((sc->flags >> 8) & 0xff) | ((sc->flags >> 12) & 0x0f00));
+ }
+-                                
++
+ static inline void svm_load_seg(target_phys_addr_t addr, SegmentCache *sc)
+ {
+     unsigned int flags;
+@@ -5473,7 +5532,7 @@ static inline void svm_load_seg(target_phys_addr_t addr, SegmentCache *sc)
+     sc->flags = ((flags & 0xff) << 8) | ((flags & 0x0f00) << 12);
+ }
+ 
+-static inline void svm_load_seg_cache(target_phys_addr_t addr, 
++static inline void svm_load_seg_cache(target_phys_addr_t addr,
+                                       CPUX86State *env, int seg_reg)
+ {
+     SegmentCache sc1, *sc = &sc1;
+@@ -5516,13 +5575,13 @@ void helper_vmrun(int aflag, int next_eip_addend)
+     stq_phys(env->vm_hsave + offsetof(struct vmcb, save.efer), env->efer);
+     stq_phys(env->vm_hsave + offsetof(struct vmcb, save.rflags), compute_eflags());
+ 
+-    svm_save_seg(env->vm_hsave + offsetof(struct vmcb, save.es), 
++    svm_save_seg(env->vm_hsave + offsetof(struct vmcb, save.es),
+                   &env->segs[R_ES]);
+-    svm_save_seg(env->vm_hsave + offsetof(struct vmcb, save.cs), 
++    svm_save_seg(env->vm_hsave + offsetof(struct vmcb, save.cs),
+                  &env->segs[R_CS]);
+-    svm_save_seg(env->vm_hsave + offsetof(struct vmcb, save.ss), 
++    svm_save_seg(env->vm_hsave + offsetof(struct vmcb, save.ss),
+                  &env->segs[R_SS]);
+-    svm_save_seg(env->vm_hsave + offsetof(struct vmcb, save.ds), 
++    svm_save_seg(env->vm_hsave + offsetof(struct vmcb, save.ds),
+                  &env->segs[R_DS]);
+ 
+     stq_phys(env->vm_hsave + offsetof(struct vmcb, save.rip),
+@@ -5566,7 +5625,7 @@ void helper_vmrun(int aflag, int next_eip_addend)
+             env->hflags2 |= HF2_HIF_MASK;
+     }
+ 
+-    cpu_load_efer(env, 
++    cpu_load_efer(env,
+                   ldq_phys(env->vm_vmcb + offsetof(struct vmcb, save.efer)));
+     env->mflags = 0;
+     load_eflags(ldq_phys(env->vm_vmcb + offsetof(struct vmcb, save.rflags)),
+@@ -5710,13 +5769,13 @@ void helper_vmsave(int aflag)
+                 addr, ldq_phys(addr + offsetof(struct vmcb, save.fs.base)),
+                 env->segs[R_FS].base);
+ 
+-    svm_save_seg(addr + offsetof(struct vmcb, save.fs), 
++    svm_save_seg(addr + offsetof(struct vmcb, save.fs),
+                  &env->segs[R_FS]);
+-    svm_save_seg(addr + offsetof(struct vmcb, save.gs), 
++    svm_save_seg(addr + offsetof(struct vmcb, save.gs),
+                  &env->segs[R_GS]);
+-    svm_save_seg(addr + offsetof(struct vmcb, save.tr), 
++    svm_save_seg(addr + offsetof(struct vmcb, save.tr),
+                  &env->tr);
+-    svm_save_seg(addr + offsetof(struct vmcb, save.ldtr), 
++    svm_save_seg(addr + offsetof(struct vmcb, save.ldtr),
+                  &env->ldt);
+ 
+ #ifdef TARGET_X86_64
+@@ -5754,7 +5813,7 @@ void helper_invlpga(int aflag)
+ {
+     target_ulong addr;
+     helper_svm_check_intercept_param(SVM_EXIT_INVLPGA, 0);
+-    
++
+     if (aflag == 2)
+         addr = EAX;
+     else
+@@ -5843,7 +5902,7 @@ void svm_check_intercept(CPUX86State *env1, uint32_t type)
+     env = saved_env;
+ }
+ 
+-void helper_svm_check_io(uint32_t port, uint32_t param, 
++void helper_svm_check_io(uint32_t port, uint32_t param,
+                          uint32_t next_eip_addend)
+ {
+     if (env->intercept & (1ULL << (SVM_EXIT_IOIO - SVM_EXIT_INTR))) {
+@@ -5852,7 +5911,7 @@ void helper_svm_check_io(uint32_t port, uint32_t param,
+         uint16_t mask = (1 << ((param >> 4) & 7)) - 1;
+         if(lduw_phys(addr + port / 8) & (mask << (port & 7))) {
+             /* next EIP */
+-            stq_phys(env->vm_vmcb + offsetof(struct vmcb, control.exit_info_2), 
++            stq_phys(env->vm_vmcb + offsetof(struct vmcb, control.exit_info_2),
+                      env->eip + next_eip_addend);
+             helper_vmexit(SVM_EXIT_IOIO, param | (port << 16));
+         }
+@@ -5877,13 +5936,13 @@ void helper_vmexit(uint32_t exit_code, uint64_t exit_info_1)
+     }
+ 
+     /* Save the VM state in the vmcb */
+-    svm_save_seg(env->vm_vmcb + offsetof(struct vmcb, save.es), 
++    svm_save_seg(env->vm_vmcb + offsetof(struct vmcb, save.es),
+                  &env->segs[R_ES]);
+-    svm_save_seg(env->vm_vmcb + offsetof(struct vmcb, save.cs), 
++    svm_save_seg(env->vm_vmcb + offsetof(struct vmcb, save.cs),
+                  &env->segs[R_CS]);
+-    svm_save_seg(env->vm_vmcb + offsetof(struct vmcb, save.ss), 
++    svm_save_seg(env->vm_vmcb + offsetof(struct vmcb, save.ss),
+                  &env->segs[R_SS]);
+-    svm_save_seg(env->vm_vmcb + offsetof(struct vmcb, save.ds), 
++    svm_save_seg(env->vm_vmcb + offsetof(struct vmcb, save.ds),
+                  &env->segs[R_DS]);
+ 
+     stq_phys(env->vm_vmcb + offsetof(struct vmcb, save.gdtr.base), env->gdt.base);
+@@ -5932,7 +5991,7 @@ void helper_vmexit(uint32_t exit_code, uint64_t exit_info_1)
+     cpu_x86_update_cr3(env, ldq_phys(env->vm_hsave + offsetof(struct vmcb, save.cr3)));
+     /* we need to set the efer after the crs so the hidden flags get
+        set properly */
+-    cpu_load_efer(env, 
++    cpu_load_efer(env,
+                   ldq_phys(env->vm_hsave + offsetof(struct vmcb, save.efer)));
+     env->mflags = 0;
+     load_eflags(ldq_phys(env->vm_hsave + offsetof(struct vmcb, save.rflags)),
+diff --git a/qemu/tcg/tcg-llvm.cpp b/qemu/tcg/tcg-llvm.cpp
+index a3d07e9..cf21f62 100644
+--- a/qemu/tcg/tcg-llvm.cpp
++++ b/qemu/tcg/tcg-llvm.cpp
+@@ -386,8 +386,8 @@ TCGLLVMContextPrivate::~TCGLLVMContextPrivate()
+ #ifdef CONFIG_S2E
+ void TCGLLVMContextPrivate::initializeHelpers()
+ {
+-    m_helperTraceMemoryAccess =
+-            m_module->getFunction("tcg_llvm_trace_memory_access");
++//    m_helperTraceMemoryAccess = // MJR
++//            m_module->getFunction("tcg_llvm_trace_memory_access");
+ 
+     m_helperTraceInstruction =
+             m_module->getFunction("tcg_llvm_trace_instruction");
+@@ -407,7 +407,7 @@ void TCGLLVMContextPrivate::initializeHelpers()
+     m_qemu_st_helpers[3] = m_module->getFunction("__stq_mmu");
+     m_qemu_st_helpers[4] = m_module->getFunction("__stq_mmu");
+ 
+-    assert(m_helperTraceMemoryAccess);
++    // assert(m_helperTraceMemoryAccess); // MJR
+     for(int i = 0; i < 5; ++i) {
+         assert(m_qemu_ld_helpers[i]);
+         assert(m_qemu_st_helpers[i]);
+diff --git a/qemu/ui/sdl.c b/qemu/ui/sdl.c
+index f91b26e..f5caa02 100644
+--- a/qemu/ui/sdl.c
++++ b/qemu/ui/sdl.c
+@@ -25,8 +25,8 @@
+ /* Avoid compiler warning because macro is redefined in SDL_syswm.h. */
+ #undef WIN32_LEAN_AND_MEAN
+ 
+-#include <SDL.h>
+-#include <SDL_syswm.h>
++#include <SDL/SDL.h>
++#include <SDL/SDL_syswm.h>
+ 
+ #include "qemu-common.h"
+ #include "console.h"
+diff --git a/qemu/ui/sdl_zoom.h b/qemu/ui/sdl_zoom.h
+index 74955bc..9bc13ae 100644
+--- a/qemu/ui/sdl_zoom.h
++++ b/qemu/ui/sdl_zoom.h
+@@ -14,7 +14,7 @@
+ #ifndef SDL_zoom_h
+ #define SDL_zoom_h
+ 
+-#include <SDL.h>
++#include <SDL/SDL.h>
+ 
+ #define SMOOTHING_OFF		0
+ #define SMOOTHING_ON		1
+diff --git a/qemu/vl.c b/qemu/vl.c
+index f4779ba..35fe915 100644
+--- a/qemu/vl.c
++++ b/qemu/vl.c
+@@ -2522,6 +2522,15 @@ int main(int argc, char **argv, char **envp)
+               }
+               break;
+ 
++            case QEMU_OPTION_fake_pci_cap_pm: // PM support
++              g_fake_pci.cap_pm = strtol(optarg, NULL, 0);
++              break;
++            case QEMU_OPTION_fake_pci_cap_msi: // MSI support
++              g_fake_pci.cap_msi = strtol(optarg, NULL, 0);
++              break;
++            case QEMU_OPTION_fake_pci_cap_pcie: // PCI-E support
++              g_fake_pci.cap_pcie = strtol(optarg, NULL, 0);
++              break;
+ #endif
+ 
+             case QEMU_OPTION_hda:
+diff --git a/stp/include/stp/c_interface.h b/stp/include/stp/c_interface.h
+deleted file mode 120000
+index 68bfb2e..0000000
+--- a/stp/include/stp/c_interface.h
++++ /dev/null
+@@ -1 +0,0 @@
+-../../src/c_interface/c_interface.h
+\ No newline at end of file
+diff --git a/stp/include/stp/c_interface.h b/stp/include/stp/c_interface.h
+new file mode 100644
+index 0000000..db5b14c
+--- /dev/null
++++ b/stp/include/stp/c_interface.h
+@@ -0,0 +1,462 @@
++/********************************************************************
++ * AUTHORS: Vijay Ganesh
++ *
++ * BEGIN DATE: November, 2005
++ *
++ * License to use, copy, modify, sell and/or distribute this software
++ * and its documentation for any purpose is hereby granted without
++ * royalty, subject to the terms and conditions defined in the \ref
++ * LICENSE file provided with this distribution.  In particular:
++ *
++ * - The above copyright notice and this permission notice must appear
++ * in all copies of the software and related documentation.
++ *
++ * - THE SOFTWARE IS PROVIDED "AS-IS", WITHOUT ANY WARRANTIES,
++ * EXPRESSED OR IMPLIED.  USE IT AT YOUR OWN RISK.
++ ********************************************************************/
++// -*- c++ -*-
++
++#ifndef _cvcl__include__c_interface_h_
++#define _cvcl__include__c_interface_h_
++
++#ifdef __cplusplus
++#define _CVCL_DEFAULT_ARG(v) =v
++#else
++#define _CVCL_DEFAULT_ARG(v)
++#endif
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#include <stdio.h>
++
++#ifdef STP_STRONG_TYPING
++#else
++  //This gives absolutely no pointer typing at compile-time. Most C
++  //users prefer this over stronger typing. User is the king. A
++  //stronger typed interface is in the works.
++  typedef void* VC;
++  typedef void* Expr;
++  typedef void* Type;
++  typedef void* WholeCounterExample;
++#endif
++
++  // o  : optimizations
++  // c  : check counterexample
++  // p  : print counterexample
++  // h  : help
++  // s  : stats
++  // v  : print nodes
++  void vc_setFlags(VC vc, char c, int num_absrefine _CVCL_DEFAULT_ARG(0));
++
++  //! Interface-only flags.
++  enum ifaceflag_t {
++  /*! EXPRDELETE: boolean, default true. For objects created by
++    vc_arrayType, vc_bvType, vc_bv32Type, vc_bvConstExprFromInt, if
++    this flag is set both at the time the objects are created and at
++    the time that vc_Destroy is called, vc_Destroy will automatically
++    delete them. */
++    EXPRDELETE,
++    MS,
++    SMS,
++    CMS2,
++    MSP
++
++  };
++  void vc_setInterfaceFlags(VC vc, enum ifaceflag_t f, int param_value);
++
++  //! Flags can be NULL
++  VC vc_createValidityChecker(void);
++
++  // Basic types
++  Type vc_boolType(VC vc);
++
++  //! Create an array type
++  Type vc_arrayType(VC vc, Type typeIndex, Type typeData);
++
++  /////////////////////////////////////////////////////////////////////////////
++  // Expr manipulation methods                                               //
++  /////////////////////////////////////////////////////////////////////////////
++
++  //! Create a variable with a given name and type
++  /*! The type cannot be a function type. The var name can contain
++    only variables, numerals and underscore. If you use any other
++    symbol, you will get a segfault. */
++  Expr vc_varExpr(VC vc, const char * name, Type type);
++
++  //The var name can contain only variables, numerals and
++  //underscore. If you use any other symbol, you will get a segfault.
++  Expr vc_varExpr1(VC vc, const char* name,
++                   int indexwidth, int valuewidth);
++
++  //! Get the expression and type associated with a name.
++  /*!  If there is no such Expr, a NULL Expr is returned. */
++  //Expr vc_lookupVar(VC vc, char* name, Type* type);
++
++  //! Get the type of the Expr.
++  Type vc_getType(VC vc, Expr e);
++
++  int vc_getBVLength(VC vc, Expr e);
++
++  //! Create an equality expression.  The two children must have the same type.
++  Expr vc_eqExpr(VC vc, Expr child0, Expr child1);
++
++  // Boolean expressions
++
++  // The following functions create Boolean expressions.  The children
++  // provided as arguments must be of type Boolean (except for the
++  // function vc_iteExpr(). In the case of vc_iteExpr() the
++  // conditional must always be Boolean, but the ifthenpart
++  // (resp. elsepart) can be bit-vector or Boolean type. But, the
++  // ifthenpart and elsepart must be both of the same type)
++  Expr vc_trueExpr(VC vc);
++  Expr vc_falseExpr(VC vc);
++  Expr vc_notExpr(VC vc, Expr child);
++  Expr vc_andExpr(VC vc, Expr left, Expr right);
++  Expr vc_andExprN(VC vc, Expr* children, int numOfChildNodes);
++  Expr vc_orExpr(VC vc, Expr left, Expr right);
++  Expr vc_xorExpr(VC vc, Expr left, Expr right);
++  Expr vc_orExprN(VC vc, Expr* children, int numOfChildNodes);
++  Expr vc_impliesExpr(VC vc, Expr hyp, Expr conc);
++  Expr vc_iffExpr(VC vc, Expr left, Expr right);
++  //The output type of vc_iteExpr can be Boolean (formula-level ite)
++  //or bit-vector (word-level ite)
++  Expr vc_iteExpr(VC vc, Expr conditional, Expr ifthenpart, Expr elsepart);
++
++  //Boolean to single bit BV Expression
++  Expr vc_boolToBVExpr(VC vc, Expr form);
++
++  //Parameterized Boolean Expression (PARAMBOOL, Boolean_Var, parameter)
++  Expr vc_paramBoolExpr(VC vc, Expr var, Expr param);
++
++  // Arrays
++
++  //! Create an expression for the value of array at the given index
++  Expr vc_readExpr(VC vc, Expr array, Expr index);
++
++  //! Array update; equivalent to "array WITH [index] := newValue"
++  Expr vc_writeExpr(VC vc, Expr array, Expr index, Expr newValue);
++
++  // Expr I/O: Parses directly from file in the c_interface. pretty cool!!
++  Expr vc_parseExpr(VC vc, const char* s);
++
++  //! Prints 'e' to stdout.
++  void vc_printExpr(VC vc, Expr e);
++
++  void vc_printExprStream(void *stream, VC vc, Expr e);
++
++  //! Prints 'e' to stdout as C code
++  void vc_printExprCCode(VC vc, Expr e);
++
++  //! print in smtlib format
++  char * vc_printSMTLIB(VC vc, Expr e);
++
++  //! Prints 'e' into an open file descriptor 'fd'
++  void vc_printExprFile(VC vc, Expr e, int fd);
++
++  //! Prints state of 'vc' into malloc'd buffer '*buf' and stores the
++  //  length into '*len'.  It is the responsibility of the caller to
++  //  free the buffer.
++  //void vc_printStateToBuffer(VC vc, char **buf, unsigned long *len);
++
++  //! Prints 'e' to malloc'd buffer '*buf'.  Sets '*len' to the length of
++  //  the buffer. It is the responsibility of the caller to free the buffer.
++  void vc_printExprToBuffer(VC vc, Expr e, char **buf, unsigned long * len);
++
++  //! Prints counterexample to stdout.
++  void vc_printCounterExample(VC vc);
++
++  //! Prints variable declarations to stdout.
++  void vc_printVarDecls(VC vc);
++
++  //! Clear the internal list of variables to declare maintained for
++  //  vc_printVarDecls. Do this after you've printed them, or if you
++  //  never want to print them, to prevent a memory leak.
++  void vc_clearDecls(VC vc);
++
++  //! Prints asserts to stdout. The flag simplify_print must be set to
++  //"1" if you wish simplification to occur dring printing. It must be
++  //set to "0" otherwise
++  void vc_printAsserts(VC vc, int simplify_print _CVCL_DEFAULT_ARG(0));
++
++  //! Prints the state of the query to malloc'd buffer '*buf' and
++  //stores ! the length of the buffer to '*len'.  It is the
++  //responsibility of the caller to free the buffer. The flag
++  //simplify_print must be set to "1" if you wish simplification to
++  //occur dring printing. It must be set to "0" otherwise
++  void vc_printQueryStateToBuffer(VC vc, Expr e,
++                                  char **buf, unsigned long *len, int simplify_print);
++
++  //! Similar to vc_printQueryStateToBuffer()
++  void vc_printCounterExampleToBuffer(VC vc, char **buf,unsigned long *len);
++
++  //! Prints query to stdout.
++  void vc_printQuery(VC vc);
++
++  /////////////////////////////////////////////////////////////////////////////
++  // Context-related methods                                                 //
++  /////////////////////////////////////////////////////////////////////////////
++
++  //! Assert a new formula in the current context.
++  /*! The formula must have Boolean type. */
++  void vc_assertFormula(VC vc, Expr e, int absrefine_bucket_num _CVCL_DEFAULT_ARG(0));
++
++  //! Simplify e with respect to the current context
++  Expr vc_simplify(VC vc, Expr e);
++
++  //! Check validity of e in the current context. e must be a FORMULA
++  //
++  //if returned 0 then input is INVALID.
++  //
++  //if returned 1 then input is VALID
++  //
++  //if returned 2 then ERROR
++  int vc_query(VC vc, Expr e);
++
++  //! Return the counterexample after a failed query.
++  Expr vc_getCounterExample(VC vc, Expr e);
++
++  //! Return an array from a counterexample after a failed query.
++  void vc_getCounterExampleArray(VC vc, Expr e, Expr **indices, Expr **values, int *size);
++    
++  //! get size of counterexample, i.e. the number of variables/array
++  //locations in the counterexample.
++  int vc_counterexample_size(VC vc);
++
++  //! Checkpoint the current context and increase the scope level
++  void vc_push(VC vc);
++
++  //! Restore the current context to its state at the last checkpoint
++  void vc_pop(VC vc);
++
++  //! Return an int from a constant bitvector expression
++  int getBVInt(Expr e);
++  //! Return an unsigned int from a constant bitvector expression
++  unsigned int getBVUnsigned(Expr e);
++  //! Return an unsigned long long int from a constant bitvector expressions
++  unsigned long long int getBVUnsignedLongLong(Expr e);
++
++  /**************************/
++  /* BIT VECTOR OPERATIONS  */
++  /**************************/
++  Type vc_bvType(VC vc, int no_bits);
++  Type vc_bv32Type(VC vc);
++
++  Expr vc_bvConstExprFromDecStr(VC vc, int width, const char* decimalInput );
++  Expr vc_bvConstExprFromStr(VC vc, const char* binary_repr);
++  Expr vc_bvConstExprFromInt(VC vc, int n_bits, unsigned int value);
++  Expr vc_bvConstExprFromLL(VC vc, int n_bits, unsigned long long value);
++  Expr vc_bv32ConstExprFromInt(VC vc, unsigned int value);
++
++  Expr vc_bvConcatExpr(VC vc, Expr left, Expr right);
++  Expr vc_bvPlusExpr(VC vc, int n_bits, Expr left, Expr right);
++  Expr vc_bvPlusExprN(VC vc, int n_bits, Expr* children, int numOfChildNodes);
++  Expr vc_bv32PlusExpr(VC vc, Expr left, Expr right);
++  Expr vc_bvMinusExpr(VC vc, int n_bits, Expr left, Expr right);
++  Expr vc_bv32MinusExpr(VC vc, Expr left, Expr right);
++  Expr vc_bvMultExpr(VC vc, int n_bits, Expr left, Expr right);
++  Expr vc_bv32MultExpr(VC vc, Expr left, Expr right);
++  // left divided by right i.e. left/right
++  Expr vc_bvDivExpr(VC vc, int n_bits, Expr left, Expr right);
++  // left modulo right i.e. left%right
++  Expr vc_bvModExpr(VC vc, int n_bits, Expr left, Expr right);
++  // signed left divided by right i.e. left/right
++  Expr vc_sbvDivExpr(VC vc, int n_bits, Expr left, Expr right);
++  // signed left modulo right i.e. left%right
++  Expr vc_sbvModExpr(VC vc, int n_bits, Expr left, Expr right);
++
++  Expr vc_bvLtExpr(VC vc, Expr left, Expr right);
++  Expr vc_bvLeExpr(VC vc, Expr left, Expr right);
++  Expr vc_bvGtExpr(VC vc, Expr left, Expr right);
++  Expr vc_bvGeExpr(VC vc, Expr left, Expr right);
++
++  Expr vc_sbvLtExpr(VC vc, Expr left, Expr right);
++  Expr vc_sbvLeExpr(VC vc, Expr left, Expr right);
++  Expr vc_sbvGtExpr(VC vc, Expr left, Expr right);
++  Expr vc_sbvGeExpr(VC vc, Expr left, Expr right);
++
++  Expr vc_bvUMinusExpr(VC vc, Expr child);
++
++  // bitwise operations: these are terms not formulas
++  Expr vc_bvAndExpr(VC vc, Expr left, Expr right);
++  Expr vc_bvOrExpr(VC vc, Expr left, Expr right);
++  Expr vc_bvXorExpr(VC vc, Expr left, Expr right);
++  Expr vc_bvNotExpr(VC vc, Expr child);
++
++  Expr vc_bvLeftShiftExpr(VC vc, int sh_amt, Expr child);
++  Expr vc_bvRightShiftExpr(VC vc, int sh_amt, Expr child);
++  /* Same as vc_bvLeftShift only that the answer in 32 bits long */
++  Expr vc_bv32LeftShiftExpr(VC vc, int sh_amt, Expr child);
++  /* Same as vc_bvRightShift only that the answer in 32 bits long */
++  Expr vc_bv32RightShiftExpr(VC vc, int sh_amt, Expr child);
++  Expr vc_bvVar32LeftShiftExpr(VC vc, Expr sh_amt, Expr child);
++  Expr vc_bvVar32RightShiftExpr(VC vc, Expr sh_amt, Expr child);
++  Expr vc_bvVar32DivByPowOfTwoExpr(VC vc, Expr child, Expr rhs);
++
++  Expr vc_bvExtract(VC vc, Expr child, int high_bit_no, int low_bit_no);
++
++  //accepts a bitvector and position, and returns a boolean
++  //corresponding to that position. More precisely, it return the
++  //equation (x[bit_no:bit_no] == 0)
++  Expr vc_bvBoolExtract(VC vc, Expr x, int bit_no);
++  Expr vc_bvBoolExtract_Zero(VC vc, Expr x, int bit_no);
++
++  //accepts a bitvector and position, and returns a boolean
++  //corresponding to that position. More precisely, it return the
++  //equation (x[bit_no:bit_no] == 1)
++  Expr vc_bvBoolExtract_One(VC vc, Expr x, int bit_no);
++  Expr vc_bvSignExtend(VC vc, Expr child, int nbits);
++
++  /*C pointer support:  C interface to support C memory arrays in CVCL */
++  Expr vc_bvCreateMemoryArray(VC vc, const char * arrayName);
++  Expr vc_bvReadMemoryArray(VC vc,
++                            Expr array, Expr byteIndex, int numOfBytes);
++  Expr vc_bvWriteToMemoryArray(VC vc,
++                               Expr array, Expr  byteIndex,
++                               Expr element, int numOfBytes);
++  Expr vc_bv32ConstExprFromInt(VC vc, unsigned int value);
++
++  // return a string representation of the Expr e. The caller is responsible
++  // for deallocating the string with free()
++  char* exprString(Expr e);
++
++  // return a string representation of the Type t. The caller is responsible
++  // for deallocating the string with free()
++  char* typeString(Type t);
++
++  Expr getChild(Expr e, int i);
++
++  //1.if input expr is TRUE then the function returns 1;
++  //
++  //2.if input expr is FALSE then function returns 0;
++  //
++  //3.otherwise the function returns -1
++  int vc_isBool(Expr e);
++
++  /* Register the given error handler to be called for each fatal error.*/
++  void vc_registerErrorHandler(void (*error_hdlr)(const char* err_msg));
++
++  int vc_getHashQueryStateToBuffer(VC vc, Expr query);
++
++  //destroys the STP instance, and removes all the created expressions
++  void vc_Destroy(VC vc);
++
++  //deletes the expression e
++  void vc_DeleteExpr(Expr e);
++
++  //Get the whole counterexample from the current context
++  WholeCounterExample vc_getWholeCounterExample(VC vc);
++
++  //Get the value of a term expression from the CounterExample
++  Expr vc_getTermFromCounterExample(VC vc, Expr e, WholeCounterExample c);
++
++
++  // Free the return value of vc_getWholeCounterExample
++  void vc_deleteWholeCounterExample(WholeCounterExample cc);
++
++  //Kinds of Expr
++  enum exprkind_t{
++      UNDEFINED,
++      SYMBOL,
++      BVCONST,
++      BVNEG,
++      BVCONCAT,
++      BVOR,
++      BVAND,
++      BVXOR,
++      BVNAND,
++      BVNOR,
++      BVXNOR,
++      BVEXTRACT,
++      BVLEFTSHIFT,
++      BVRIGHTSHIFT,
++      BVSRSHIFT,
++      BVVARSHIFT,
++      BVPLUS,
++      BVSUB,
++      BVUMINUS,
++      BVMULTINVERSE,
++      BVMULT,
++      BVDIV,
++      BVMOD,
++      SBVDIV,
++      SBVREM,
++      SBVMOD,
++      BVSX,
++      BVZX,
++      ITE,
++      BVGETBIT,
++      BVLT,
++      BVLE,
++      BVGT,
++      BVGE,
++      BVSLT,
++      BVSLE,
++      BVSGT,
++      BVSGE,
++      EQ,
++      FALSE,
++      TRUE,
++      NOT,
++      AND,
++      OR,
++      NAND,
++      NOR,
++      XOR,
++      IFF,
++      IMPLIES,
++      PARAMBOOL,
++      READ,
++      WRITE,
++      ARRAY,
++      BITVECTOR,
++      BOOLEAN
++  } ;
++
++  // type of expression
++  enum type_t {
++    BOOLEAN_TYPE = 0,
++    BITVECTOR_TYPE,
++    ARRAY_TYPE,
++    UNKNOWN_TYPE
++  };
++
++  // get the kind of the expression
++  enum exprkind_t getExprKind (Expr e);
++
++  // get the number of children nodes
++  int getDegree (Expr e);
++
++  // get the bv length
++  int getBVLength(Expr e);
++
++  // get expression type
++  enum type_t getType (Expr e);
++
++  // get value bit width
++  int getVWidth (Expr e);
++
++  // get index bit width
++  int getIWidth (Expr e);
++
++  // Prints counterexample to an open file descriptor 'fd'
++  void vc_printCounterExampleFile(VC vc, int fd);
++
++  // get name of expression. must be a variable.
++  const char* exprName(Expr e);
++
++  // get the node ID of an Expr.
++  int getExprID (Expr ex);
++
++  // parse the expr from memory string!
++  int vc_parseMemExpr(VC vc, const char* s, Expr* oquery, Expr* oasserts );
++#ifdef __cplusplus
++}
++#endif
++
++#undef _CVCL_DEFAULT_ARG
++
++#endif
++
++
+-- 
+1.8.5.rc1.28.g7061504
+
