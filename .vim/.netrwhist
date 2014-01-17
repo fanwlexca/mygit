@@ -1,0 +1,7 @@
+let g:netrw_dirhistmax  =10
+let g:netrw_dirhist_cnt =5
+let g:netrw_dirhist_1='/home/fwl/meepodisk'
+let g:netrw_dirhist_2='/home/fwl/s2e/symdrive/qemu/configs-linux'
+let g:netrw_dirhist_3='/home/fwl/symbolic-kernel/klee/lib'
+let g:netrw_dirhist_4='/home/fwl/symbolic-kernel/klee/test'
+let g:netrw_dirhist_5='/home/fwl/.vim/autoload'
