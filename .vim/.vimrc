@@ -3,6 +3,7 @@ syntax on
 
 "set mouse=a
 filetype plugin on
+set hls
 
 colorscheme desert
 
@@ -30,7 +31,8 @@ let mapleader=","
 set noswapfile
 "显示缩进线
 set list 
-set lcs=tab:\|\ 
+"set lcs=tab:\|\ 
+set lcs=tab:>-,trail:-
 "backspace可以删除
 set backspace=indent,eol,start
 "编码问题，保存为set fileencoding=gb18030,打开检测set fileencodings
@@ -49,6 +51,7 @@ set cindent
 set tabstop=4
 set softtabstop=4
 set shiftwidth=4
+set expandtab
 "取消自动注释set noautoindent,set fo-=r
 set fo-=r
 
